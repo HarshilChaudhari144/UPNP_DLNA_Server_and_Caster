@@ -272,26 +272,52 @@ internal class PlaybackController(
                 try {
                     val device = getActiveDevice()
                     val av = getAVTransport(device)
+                    // RenderingControl handles Volume/Mute
+                    val rc = device.services.find { it.serviceType.contains("RenderingControl") }
 
-                    // 1. Poll Transport Info (To update state from TRANSITIONING -> PLAYING)
+                    // 1. Poll Transport Info (Status)
                     val statusXml = soapClient.sendAction(av.controlUrl, av.serviceType, "GetTransportInfo", mapOf("InstanceID" to "0"))
                     val stateStr = extractValueRegex(statusXml, "CurrentTransportState")
                     val transportState = mapTransportState(stateStr ?: "")
 
-                    // 2. Poll Position Info (Time)
+                    // 2. Poll Position Info (Time & Duration)
                     val posXml = soapClient.sendAction(av.controlUrl, av.serviceType, "GetPositionInfo", mapOf("InstanceID" to "0"))
+
                     val timeStr = extractValueRegex(posXml, "RelTime")
                     val position = parseDuration(timeStr)
 
-                    // 3. Update State
+                    val durStr = extractValueRegex(posXml, "TrackDuration")
+                    val duration = parseDuration(durStr)
+
+                    // 3. Poll Volume & Mute (If service exists)
+                    var volume: Int? = null
+                    var muted: Boolean? = null
+
+                    if (rc != null) {
+                        try {
+                            val volXml = soapClient.sendAction(rc.controlUrl, rc.serviceType, "GetVolume", mapOf("InstanceID" to "0", "Channel" to "Master"))
+                            volume = extractValueRegex(volXml, "CurrentVolume")?.toIntOrNull()
+
+                            val muteXml = soapClient.sendAction(rc.controlUrl, rc.serviceType, "GetMute", mapOf("InstanceID" to "0", "Channel" to "Master"))
+                            val muteStr = extractValueRegex(muteXml, "CurrentMute")
+                            muted = (muteStr == "1" || muteStr.equals("true", true))
+                        } catch (e: Exception) { /* Ignore volume poll errors */ }
+                    }
+
+                    // 4. Update State
                     _playbackState.update {
                         it.copy(
+                            transportState = transportState,
                             position = position,
-                            transportState = transportState
+                            // Only update duration if valid, otherwise keep existing
+                            duration = if (duration != null && duration.inWholeSeconds > 0) duration else it.duration,
+                            // Only update volume/mute if we successfully polled them
+                            volume = volume ?: it.volume,
+                            muted = muted ?: it.muted
                         )
                     }
 
-                } catch (e: Exception) { /* Squelch */ }
+                } catch (e: Exception) { /* Squelch global errors */ }
                 delay(1000)
             }
         }
