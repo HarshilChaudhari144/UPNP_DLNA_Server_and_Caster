@@ -5,12 +5,13 @@ import com.example.mysecondapp.dlna_lib.api.device.DeviceRegistry
 import com.example.mysecondapp.dlna_lib.api.media.MediaServerApi
 import com.example.mysecondapp.dlna_lib.api.playback.PlaybackApi
 import com.example.mysecondapp.dlna_lib.platform.DlnaPlatform
+import com.example.mysecondapp.dlna_lib.core.lifecycle.DlnaEngine
 
 /**
  * The central entry point for the DLNA library.
  */
 object DlnaManager {
-
+    private var engine: DlnaEngine? = null
     lateinit var devices: DeviceRegistry
         internal set
 
@@ -32,6 +33,7 @@ object DlnaManager {
         platform: DlnaPlatform
     ) {
         // Implementation will delegate to DlnaEngine in the Core layer
+        engine = DlnaEngine(config, platform).apply { start() }
     }
 
     /**
@@ -39,5 +41,7 @@ object DlnaManager {
      */
     fun stop() {
         // Implementation will stop the internal engine
+        engine?.stop()
+        engine = null
     }
 }
