@@ -23,6 +23,9 @@ internal class DidlLiteParser {
             return BrowseResult(emptyList(), emptyList(), 0, 0)
         }
 
+        // 1. Prepare XML (Handle fragments, unescaping)
+        val validXml = prepareXml(xml)
+
         val containers = ArrayList<MediaContainer>()
         val items = ArrayList<MediaItem>()
 
@@ -30,7 +33,7 @@ internal class DidlLiteParser {
             val factory = DocumentBuilderFactory.newInstance()
             factory.isNamespaceAware = true
             val builder = factory.newDocumentBuilder()
-            val inputSource = InputSource(StringReader(xml))
+            val inputSource = InputSource(StringReader(validXml))
             val doc = builder.parse(inputSource)
 
             doc.documentElement.normalize()
@@ -42,6 +45,7 @@ internal class DidlLiteParser {
                 val node = childNodes.item(i)
                 if (node.nodeType == Node.ELEMENT_NODE) {
                     val element = node as Element
+                    // Match purely on local name to avoid namespace headaches
                     when (element.localName) {
                         "container" -> parseContainer(element)?.let { containers.add(it) }
                         "item" -> parseItem(element)?.let { items.add(it) }
@@ -50,10 +54,51 @@ internal class DidlLiteParser {
             }
 
         } catch (e: Exception) {
-            DlnaLogger.e(tag, "Failed to parse DIDL-Lite XML", e)
+            DlnaLogger.e(tag, "Failed to parse DIDL-Lite XML. Content snippet: ${validXml.take(100)}", e)
         }
 
         return BrowseResult(containers, items, 0, 0)
+    }
+
+    /**
+     * Sanitizes the input string to ensure it is valid XML.
+     * 1. Unescapes &lt; if the string looks encoded.
+     * 2. Wraps in <DIDL-Lite> if it's a fragment.
+     */
+    private fun prepareXml(raw: String): String {
+        var xml = raw.trim()
+
+        // Step 1: Check if double-escaped (common in GetMediaInfo responses)
+        // If it starts with "&lt;", it means it's an escaped string, not XML yet.
+        if (xml.startsWith("&lt;")) {
+            xml = unescapeXml(xml)
+        }
+
+        // Step 2: Check for Root Element
+        // Some servers return just "<item>...</item>" without the namespace wrapper.
+        if (!xml.contains("<DIDL-Lite", ignoreCase = true) && !xml.contains(":DIDL-Lite", ignoreCase = true)) {
+            // Wrap it in a standard root with namespaces to make it valid XML
+            return """
+                <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" 
+                           xmlns:dc="http://purl.org/dc/elements/1.1/" 
+                           xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
+                $xml
+                </DIDL-Lite>
+            """.trimIndent()
+        }
+
+        return xml
+    }
+
+    private fun unescapeXml(input: String): String {
+        // We do NOT replace &amp; here.
+        // If the content is "Tom &amp; Jerry", we want to keep "&amp;"
+        // so the XML parser reads it as "Tom & Jerry".
+        // Converting it to "Tom & Jerry" (raw &) breaks XML parsing.
+        return input.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
     }
 
     private fun parseContainer(element: Element): MediaContainer? {
@@ -105,6 +150,7 @@ internal class DidlLiteParser {
 
     private fun parseResources(itemElement: Element): List<MediaResource> {
         val resList = ArrayList<MediaResource>()
+        // Use "*" to ignore namespace prefixes (dlna:res, upnp:res, or just res)
         val resNodes = itemElement.getElementsByTagNameNS("*", "res")
 
         for (i in 0 until resNodes.length) {
@@ -161,9 +207,6 @@ internal class DidlLiteParser {
         return null
     }
 
-    /**
-     * Parses DLNA duration format: H:MM:SS or H:MM:SS.F
-     */
     private fun parseDuration(timestamp: String?): Duration? {
         if (timestamp.isNullOrBlank()) return null
         try {
@@ -176,7 +219,6 @@ internal class DidlLiteParser {
             val secondsParts = parts[2].split(".")
             val s = secondsParts[0].toLong()
             val ms = if (secondsParts.size > 1) {
-                // Take first 3 digits for millis
                 secondsParts[1].take(3).padEnd(3, '0').toLong()
             } else 0L
 

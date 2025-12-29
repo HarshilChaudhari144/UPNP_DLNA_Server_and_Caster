@@ -6,12 +6,9 @@ import com.example.mysecondapp.dlna_lib.platform.HttpMethod
 import com.example.mysecondapp.dlna_lib.platform.HttpRequest
 import com.example.mysecondapp.dlna_lib.platform.HttpResponse
 import com.example.mysecondapp.dlna_lib.platform.NetworkInfoProvider
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executors
@@ -67,7 +64,7 @@ class AndroidEventCallbackServer(
                 val input = s.getInputStream()
                 val reader = BufferedReader(InputStreamReader(input))
 
-                // 1. Read Request Line: "NOTIFY /callback HTTP/1.1"
+                // 1. Read Request Line
                 val requestLine = reader.readLine() ?: return
                 val parts = requestLine.split(" ")
                 if (parts.size < 2) return
@@ -113,9 +110,8 @@ class AndroidEventCallbackServer(
                 )
 
                 // 5. Delegate to Handler (Core)
-                // Use GlobalScope or a dedicated scope because we are inside a pure Java thread here
-                // and need to bridge to suspend functions.
-                GlobalScope.launch(Dispatchers.IO) {
+                // FIX: Use runBlocking to keep the socket open while processing
+                runBlocking {
                     val response = handler?.handle(request) ?: HttpResponse(404)
 
                     // 6. Send Response

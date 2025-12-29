@@ -17,6 +17,12 @@ interface PlaybackApi {
      */
     suspend fun play(mediaItem: MediaItem, speed: String = "1")
 
+    /**
+     * Resumes playback of the *current* media from a Paused or Stopped state.
+     * Unlike [play], this does NOT re-send the URI or metadata.
+     */
+    suspend fun resume()
+
     suspend fun pause()
     suspend fun stop()
 
