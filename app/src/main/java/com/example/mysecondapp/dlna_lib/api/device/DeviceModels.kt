@@ -14,7 +14,8 @@ data class Device(
     val modelName: String?,
     val udn: String, // Unique Device Name
     val services: List<Service>,
-    val presentationUrl: String?
+    val presentationUrl: String?,
+    val locationUrl: String
 )
 
 /**

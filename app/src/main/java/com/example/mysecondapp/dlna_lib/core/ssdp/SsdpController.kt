@@ -17,39 +17,36 @@ internal class SsdpController(
 ) {
     private val tag = "SsdpController"
 
-    // M-SEARCH Packet as a String (strictly using CRLF)
-    private val mSearchPacket = """
-        M-SEARCH * HTTP/1.1
-        HOST: 239.255.255.250:1900
-        MAN: "ssdp:discover"
-        MX: 3
-        ST: ssdp:all
-        
-    """.trimIndent().replace("\n", "\r\n")
+    // Target list covers most devices
+    private val searchTargets = listOf(
+        "upnp:rootdevice",
+        "urn:schemas-upnp-org:device:MediaRenderer:1",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "ssdp:all"
+    )
 
     fun start() {
         DlnaLogger.d(tag, "Starting SSDP Controller")
-
-        // 1. Start Cache cleanup loop
         cache.start()
 
-        // 2. Start listening on Platform Transport
-        // The callback provides 'data' (String) and 'remoteAddress' (String)
-        transport.listen { data, _ ->
-            // Processing text headers is fast, so we do it directly.
-            // If this becomes heavy, wrap in dlnaScope.launch { ... }
-            handlePacket(data)
+        // 1. Listen
+        transport.listen { data, address ->
+            handlePacket(data, address)
         }
 
-        // 3. Send discovery packets (burst of 3 for reliability)
+        // 2. Send Discovery (Burst Mode)
         dlnaScope.launch(Dispatchers.IO) {
             repeat(3) {
-                try {
-                    transport.send(mSearchPacket)
-                } catch (e: Exception) {
-                    DlnaLogger.w(tag, "Failed to send M-SEARCH: ${e.message}")
+                searchTargets.forEach { target ->
+                    try {
+                        val packet = buildSearchPacket(target)
+                        transport.send(packet)
+                        delay(100)
+                    } catch (e: Exception) {
+                        DlnaLogger.w(tag, "Failed to send M-SEARCH: ${e.message}")
+                    }
                 }
-                delay(200)
+                delay(1000)
             }
         }
     }
@@ -60,13 +57,29 @@ internal class SsdpController(
         transport.stop()
     }
 
-    private fun handlePacket(text: String) {
-        try {
-            // We handle both NOTIFY (Announcements) and HTTP 200 OK (Search Responses)
-            // Note: Some devices might send leading whitespace, so trimStart is safer.
-            val cleanText = text.trimStart()
-            val firstLine = cleanText.substringBefore("\r\n").uppercase()
+    /**
+     * Constructs a strictly formatted M-SEARCH packet.
+     * CRITICAL: Must use \r\n and end with a double \r\n.
+     */
+    private fun buildSearchPacket(st: String): String {
+        val sb = StringBuilder()
+        sb.append("M-SEARCH * HTTP/1.1\r\n")
+        sb.append("HOST: 239.255.255.250:1900\r\n")
+        sb.append("MAN: \"ssdp:discover\"\r\n")
+        sb.append("MX: 3\r\n")
+        sb.append("ST: $st\r\n")
+        // Samsung & LG often require User-Agent to respond
+        sb.append("USER-AGENT: Android/1.0 DLNA-Lib/1.0 UPnP/1.1\r\n")
+        sb.append("\r\n") // Blank line to end headers
+        return sb.toString()
+    }
 
+    private fun handlePacket(text: String, address: String = "") {
+        try {
+            // Trim leading whitespace (some devices send garbage at start)
+            val cleanText = text.trimStart()
+
+            val firstLine = cleanText.substringBefore("\r\n").uppercase()
             val isNotify = firstLine.startsWith("NOTIFY")
             val isResponse = firstLine.startsWith("HTTP/1.1 200")
 
@@ -74,25 +87,21 @@ internal class SsdpController(
 
             val headers = parseHeaders(cleanText)
 
-            val udn = extractUdn(headers["USN"]) ?: return
-            val location = headers["LOCATION"]
-            val nts = headers["NTS"] // ssdp:alive or ssdp:byebye
+            val usn = headers["USN"]
+            val udn = extractUdn(usn) ?: return
 
-            // Check for ByeBye (Explicit disconnect)
+            val location = headers["LOCATION"]
+            val nts = headers["NTS"]
+
             if (nts == "ssdp:byebye") {
                 cache.recordByeBye(udn)
                 stateMachine.onSsdpByeBye(udn)
                 return
             }
 
-            // Alive or Search Response
             if (location != null) {
                 val maxAge = parseCacheControl(headers["CACHE-CONTROL"])
-
-                // Update Cache (Keep Alive)
                 cache.recordAlive(udn, maxAge)
-
-                // Tell State Machine to fetch XML (if new)
                 stateMachine.onSsdpAlive(location, maxAge)
             }
 
@@ -105,7 +114,7 @@ internal class SsdpController(
         val map = mutableMapOf<String, String>()
         val reader = BufferedReader(StringReader(text))
 
-        // Skip first line (method/status)
+        // Skip first line
         reader.readLine()
 
         var line = reader.readLine()
@@ -123,19 +132,16 @@ internal class SsdpController(
 
     private fun extractUdn(usn: String?): String? {
         if (usn == null) return null
-        // Format often: uuid:device-UUID::urn:service-type
-        // We want: uuid:device-UUID
         return if (usn.startsWith("uuid:")) {
             val parts = usn.split("::")
-            parts[0] // Returns uuid:xxxx-xxxx
+            parts[0]
         } else {
-            usn // Fallback
+            usn
         }
     }
 
     private fun parseCacheControl(cc: String?): Int {
-        if (cc == null) return 1800 // Default 30 mins
-        // Format: max-age=1800
+        if (cc == null) return 1800
         return try {
             val part = cc.split(",").find { it.trim().lowercase().startsWith("max-age") }
             part?.substringAfter("=")?.trim()?.toInt() ?: 1800

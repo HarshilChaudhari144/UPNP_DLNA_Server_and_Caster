@@ -24,14 +24,14 @@ internal class DeviceDescriptorParser {
     fun parse(xml: String, locationUrl: String): Device {
         try {
             val factory = DocumentBuilderFactory.newInstance()
-            factory.isNamespaceAware = true // Set true to handle xmlns correctly, or false to ignore
+            factory.isNamespaceAware = true
             val builder = factory.newDocumentBuilder()
             val inputSource = InputSource(StringReader(xml))
             val doc = builder.parse(inputSource)
 
             doc.documentElement.normalize()
 
-            // 1. Check for URLBase (UPnP 1.0 specific, overrides locationUrl)
+            // 1. Check for URLBase (optional, overrides locationUrl for relative paths)
             val urlBaseNode = doc.getElementsByTagName("URLBase").item(0)
             val effectiveBaseUrl = if (urlBaseNode != null && urlBaseNode.textContent.isNotBlank()) {
                 urlBaseNode.textContent.trim()
@@ -40,7 +40,6 @@ internal class DeviceDescriptorParser {
             }
 
             // 2. Find the root <device> tag
-            // Note: The root element is <root>, we need the first child <device>
             val deviceList = doc.getElementsByTagName("device")
             if (deviceList.length == 0) {
                 throw Exception("No <device> tag found in description XML")
@@ -48,7 +47,8 @@ internal class DeviceDescriptorParser {
 
             // We parse the first device found (Root Device)
             val deviceElement = deviceList.item(0) as Element
-            return parseDeviceElement(deviceElement, effectiveBaseUrl)
+            // Pass the original locationUrl to the parser
+            return parseDeviceElement(deviceElement, effectiveBaseUrl, locationUrl)
 
         } catch (e: Exception) {
             DlnaLogger.e(tag, "Failed to parse device description: ${e.message}", e)
@@ -56,16 +56,15 @@ internal class DeviceDescriptorParser {
         }
     }
 
-    private fun parseDeviceElement(element: Element, baseUrl: String): Device {
+    private fun parseDeviceElement(element: Element, baseUrl: String, originalLocationUrl: String): Device {
         val deviceType = getTagValue(element, "deviceType") ?: "unknown"
         val friendlyName = getTagValue(element, "friendlyName") ?: "Unknown Device"
         val manufacturer = getTagValue(element, "manufacturer")
         val modelName = getTagValue(element, "modelName")
-        val modelDescription = getTagValue(element, "modelDescription")
+        // REMOVED: modelDescription = getTagValue(element, "modelDescription")
         val udn = getTagValue(element, "UDN") ?: throw Exception("Device missing UDN")
         val presentationUrlRaw = getTagValue(element, "presentationURL")
 
-        // Resolve Presentation URL if it exists
         val presentationUrl = presentationUrlRaw?.let { UrlResolver.resolve(baseUrl, it) }
 
         // Parse Services
@@ -88,15 +87,16 @@ internal class DeviceDescriptorParser {
         }
 
         return Device(
-            deviceId = udn, // UDN is the unique ID
+            deviceId = udn,
             deviceType = deviceType,
             friendlyName = friendlyName,
             manufacturer = manufacturer,
             modelName = modelName,
-//            modelDescription = modelDescription,
             udn = udn,
             services = services,
-            presentationUrl = presentationUrl
+            presentationUrl = presentationUrl,
+            // ADDED: Store the original locationUrl passed to the parser
+            locationUrl = originalLocationUrl
         )
     }
 
@@ -111,7 +111,6 @@ internal class DeviceDescriptorParser {
         return Service(
             serviceType = serviceType,
             serviceId = serviceId,
-            // Crucial: Resolve relative paths to absolute URLs
             controlUrl = UrlResolver.resolve(baseUrl, controlUrlRaw),
             eventSubUrl = eventSubUrlRaw?.let { UrlResolver.resolve(baseUrl, it) },
             scpdUrl = UrlResolver.resolve(baseUrl, scpdUrlRaw)
