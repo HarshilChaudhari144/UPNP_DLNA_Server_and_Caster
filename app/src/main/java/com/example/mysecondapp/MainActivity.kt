@@ -2,6 +2,8 @@ package com.example.mysecondapp
 
 import android.Manifest
 import android.app.Application
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
@@ -16,10 +18,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.filled.Storage
-import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -38,13 +37,13 @@ import com.example.mysecondapp.dlna_lib.api.DlnaConfig
 import com.example.mysecondapp.dlna_lib.api.DlnaManager
 import com.example.mysecondapp.dlna_lib.api.browse.BrowseResult
 import com.example.mysecondapp.dlna_lib.api.device.Device
+import com.example.mysecondapp.dlna_lib.api.media.MediaItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.net.URI
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -55,11 +54,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// --- Navigation Enum ---
-enum class Screen {
-    DEVICE_LIST,
-    BROWSER
-}
+enum class Screen { DEVICE_LIST, BROWSER }
 
 @Composable
 fun DlnaApp() {
@@ -69,11 +64,124 @@ fun DlnaApp() {
                 val viewModel = viewModel<DlnaViewModel>()
                 val currentScreen by viewModel.currentScreen.collectAsState()
 
-                when (currentScreen) {
-                    Screen.DEVICE_LIST -> DeviceListScreen(viewModel)
-                    Screen.BROWSER -> BrowserScreen(viewModel)
+                // Bottom Sheet State
+                val selectedMedia by viewModel.selectedMediaItem.collectAsState()
+
+                Box(modifier = Modifier.fillMaxSize()) {
+                    // Main Content
+                    when (currentScreen) {
+                        Screen.DEVICE_LIST -> DeviceListScreen(viewModel)
+                        Screen.BROWSER -> BrowserScreen(viewModel)
+                    }
+
+                    // Playback Options Bottom Sheet
+                    if (selectedMedia != null) {
+                        PlayOptionsSheet(
+                            mediaItem = selectedMedia!!,
+                            viewModel = viewModel,
+                            onDismiss = { viewModel.clearSelection() }
+                        )
+                    }
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun PlayOptionsSheet(
+    mediaItem: MediaItem,
+    viewModel: DlnaViewModel,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val devices by viewModel.devices.collectAsState()
+
+    // Filter for Renderers only (TVs/Speakers)
+    val renderers = remember(devices) {
+        devices.filter { it.services.any { s -> s.serviceType.contains("AVTransport") } }
+    }
+
+    var showRendererList by remember { mutableStateOf(false) }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(modifier = Modifier.padding(16.dp).fillMaxWidth()) {
+            Text(
+                text = mediaItem.title,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = mediaItem.resources.firstOrNull()?.mimeType ?: "Unknown Type",
+                color = Color.Gray
+            )
+            Divider(modifier = Modifier.padding(vertical = 16.dp))
+
+            if (!showRendererList) {
+                // --- Initial Options ---
+
+                // Option 1: Play Locally
+                ListItem(
+                    headlineContent = { Text("Play Locally") },
+                    supportingContent = { Text("Open in VLC / MX Player") },
+                    leadingContent = { Icon(Icons.Default.PhoneAndroid, null) },
+                    modifier = Modifier.clickable {
+                        val uri = Uri.parse(mediaItem.resources.first().uri)
+                        val type = mediaItem.resources.first().mimeType
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, type)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        try {
+                            context.startActivity(intent)
+                        } catch (e: Exception) {
+                            Toast.makeText(context, "No app found to play this content", Toast.LENGTH_SHORT).show()
+                        }
+                        onDismiss()
+                    }
+                )
+
+                // Option 2: Cast
+                ListItem(
+                    headlineContent = { Text("Play on Device (Cast)") },
+                    supportingContent = { Text("Stream to TV or Speaker") },
+                    leadingContent = { Icon(Icons.Default.Cast, null) },
+                    modifier = Modifier.clickable {
+                        showRendererList = true
+                    }
+                )
+            } else {
+                // --- Renderer Selection List ---
+                Text("Select Device", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
+
+                if (renderers.isEmpty()) {
+                    Text("No Renderers found", modifier = Modifier.padding(16.dp), color = Color.Gray)
+                }
+
+                LazyColumn(modifier = Modifier.fillMaxHeight(0.5f)) {
+                    items(renderers) { device ->
+                        ListItem(
+                            headlineContent = { Text(device.friendlyName) },
+                            leadingContent = { Icon(Icons.Default.Tv, null) },
+                            modifier = Modifier.clickable {
+                                viewModel.playOnRenderer(device, mediaItem)
+                                Toast.makeText(context, "Casting to ${device.friendlyName}...", Toast.LENGTH_SHORT).show()
+                                onDismiss()
+                            }
+                        )
+                    }
+                }
+
+                Button(
+                    onClick = { showRendererList = false },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                ) {
+                    Text("Back")
+                }
+            }
+            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }
@@ -82,7 +190,6 @@ fun DlnaApp() {
 @Composable
 fun PermissionWrapper(content: @Composable () -> Unit) {
     var permissionsGranted by remember { mutableStateOf(false) }
-
     val launcher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
@@ -113,12 +220,7 @@ fun DeviceListScreen(viewModel: DlnaViewModel) {
     val devices by viewModel.devices.collectAsState()
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text(
-            text = "Discovered Devices",
-            fontSize = 24.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(bottom = 16.dp)
-        )
+        Text("Discovered Devices", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 16.dp))
 
         if (devices.isEmpty()) {
             Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -127,14 +229,9 @@ fun DeviceListScreen(viewModel: DlnaViewModel) {
                 Text("Scanning...", modifier = Modifier.padding(top = 48.dp))
             }
         } else {
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
+            LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(devices) { device ->
-                    DeviceCard(device) {
-                        viewModel.openBrowser(device)
-                    }
+                    DeviceCard(device) { viewModel.openBrowser(device) }
                 }
             }
         }
@@ -143,13 +240,11 @@ fun DeviceListScreen(viewModel: DlnaViewModel) {
 
 @Composable
 fun DeviceCard(device: Device, onClick: () -> Unit) {
-    // Determine Type
     val isServer = device.services.any { it.serviceType.contains("ContentDirectory") }
     val isRenderer = device.services.any { it.serviceType.contains("AVTransport") }
-
-    // UI Logic
     val icon = if (isServer) Icons.Default.Storage else Icons.Default.Tv
     val cardColor = if (isServer) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+
     val typeLabel = when {
         isServer && isRenderer -> "Server & Renderer"
         isRenderer -> "Renderer (TV/Speaker)"
@@ -164,9 +259,7 @@ fun DeviceCard(device: Device, onClick: () -> Unit) {
     Card(
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
         colors = CardDefaults.cardColors(containerColor = cardColor),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(enabled = isServer, onClick = onClick)
+        modifier = Modifier.fillMaxWidth().clickable(enabled = isServer, onClick = onClick)
     ) {
         Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(imageVector = icon, contentDescription = null, modifier = Modifier.size(40.dp))
@@ -175,9 +268,7 @@ fun DeviceCard(device: Device, onClick: () -> Unit) {
                 Text(text = device.friendlyName, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 Text(text = typeLabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                 Text(text = locationDisplay, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
-                if (isServer) {
-                    Text(text = "Tap to Browse", fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                }
+                if (isServer) Text(text = "Tap to Browse", fontSize = 10.sp, fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -190,12 +281,8 @@ fun BrowserScreen(viewModel: DlnaViewModel) {
     val browseResult by viewModel.browseResult.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val title by viewModel.currentContainerTitle.collectAsState()
-    val context = LocalContext.current
 
-    // Handle Hardware Back Button
-    BackHandler {
-        viewModel.navigateUp()
-    }
+    BackHandler { viewModel.navigateUp() }
 
     Scaffold(
         topBar = {
@@ -216,38 +303,30 @@ fun BrowserScreen(viewModel: DlnaViewModel) {
             }
         } else {
             LazyColumn(modifier = Modifier.fillMaxSize().padding(padding)) {
-                // 1. Folders
                 items(browseResult?.containers ?: emptyList()) { folder ->
                     ListItem(
                         headlineContent = { Text(folder.title, fontWeight = FontWeight.Medium) },
                         leadingContent = { Icon(Icons.Default.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.secondary) },
-                        modifier = Modifier.clickable {
-                            viewModel.browse(folder.id, folder.title)
-                        }
+                        modifier = Modifier.clickable { viewModel.browse(folder.id, folder.title) }
                     )
                     Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                 }
 
-                // 2. Files
                 items(browseResult?.items ?: emptyList()) { file ->
                     ListItem(
                         headlineContent = { Text(file.title) },
                         supportingContent = {
                             val info = file.resources.firstOrNull()
-//                            Text(text = info?.mimeType ?: "Unknown Format", fontSize = 12.sp)
-                            Column() {
+                            Column {
                                 Text(text = info?.mimeType ?: "Unknown Format", fontSize = 12.sp)
-                                Text(text = "Duration: ${info?.duration}", fontSize = 12.sp)
-                                Text(text = "Uri: ${info?.uri}", fontSize = 12.sp)
-                                Text(text = "Resolution: ${info?.resolution}", fontSize = 12.sp)
-                                Text(text = "Size: ${info?.size}", fontSize = 12.sp)
-                                Text(text = "Protocol Info: ${info?.protocolInfo}", fontSize = 12.sp)
+                                Text(text = "Dur: ${info?.duration} | Size: ${info?.size}", fontSize = 12.sp)
+                                Text(text = "Protocol: ${info?.protocolInfo}", fontSize = 10.sp, maxLines = 1)
                             }
                         },
                         leadingContent = { Icon(Icons.Default.MusicNote, contentDescription = null) },
                         modifier = Modifier.clickable {
-                            val url = file.resources.firstOrNull()?.uri
-                            Toast.makeText(context, "URL: $url", Toast.LENGTH_SHORT).show()
+                            // Instead of playing immediately, select it to show options
+                            viewModel.selectMedia(file)
                         }
                     )
                     Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
@@ -261,7 +340,6 @@ fun BrowserScreen(viewModel: DlnaViewModel) {
 
 class DlnaViewModel(application: Application) : AndroidViewModel(application) {
 
-    // --- State ---
     private val _devices = MutableStateFlow<List<Device>>(emptyList())
     val devices: StateFlow<List<Device>> = _devices.asStateFlow()
 
@@ -277,14 +355,12 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentContainerTitle = MutableStateFlow("Root")
     val currentContainerTitle: StateFlow<String> = _currentContainerTitle.asStateFlow()
 
-    // --- Internal Tracking ---
+    // Selection state for Bottom Sheet
+    private val _selectedMediaItem = MutableStateFlow<MediaItem?>(null)
+    val selectedMediaItem: StateFlow<MediaItem?> = _selectedMediaItem.asStateFlow()
+
     private var currentDeviceId: String? = null
-
-    // Tracks the ID of the folder currently displayed on screen
     private var activeContainerId: String = "0"
-
-    // Stack: Pair<ContainerId, ContainerTitle>
-    // Stores the history of folders we have visited to enable "Back" navigation
     private val historyStack = mutableListOf<Pair<String, String>>()
 
     init {
@@ -294,9 +370,7 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     private fun startDlna() {
         val context = getApplication<Application>().applicationContext
         val platform = AndroidDlnaPlatform(context)
-
         val config = DlnaConfig(false, "Scanner", null, null)
-
         DlnaManager.start(config, platform)
 
         viewModelScope.launch {
@@ -309,36 +383,25 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
         DlnaManager.stop()
     }
 
-    // --- Actions ---
+    // --- Browser Actions ---
 
     fun openBrowser(device: Device) {
         currentDeviceId = device.deviceId
         historyStack.clear()
-
-        // Switch Screen
         _currentScreen.value = Screen.BROWSER
-
-        // Load Root
         loadContainer("0", device.friendlyName)
     }
 
-    // Called when User clicks a Folder to drill down
     fun browse(targetId: String, targetTitle: String) {
-        // Push the folder we are currently LEAVING to the stack
         historyStack.add(activeContainerId to _currentContainerTitle.value)
-
-        // Load the new folder
         loadContainer(targetId, targetTitle)
     }
 
-    // Called on Back Button
     fun navigateUp() {
         if (historyStack.isNotEmpty()) {
-            // Pop the previous folder state
             val (prevId, prevTitle) = historyStack.removeAt(historyStack.lastIndex)
             loadContainer(prevId, prevTitle)
         } else {
-            // Stack is empty, exit Browser and return to Device List
             _currentScreen.value = Screen.DEVICE_LIST
             _browseResult.value = null
             currentDeviceId = null
@@ -347,14 +410,12 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun loadContainer(id: String, title: String) {
         val deviceId = currentDeviceId ?: return
-
         _isLoading.value = true
         _currentContainerTitle.value = title
         activeContainerId = id
 
         viewModelScope.launch {
             try {
-                // Network call on IO
                 val result = withContext(Dispatchers.IO) {
                     DlnaManager.browser.browse(deviceId, id, 0, 100)
                 }
@@ -363,6 +424,33 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
                 e.printStackTrace()
             } finally {
                 _isLoading.value = false
+            }
+        }
+    }
+
+    // --- Selection & Playback Actions ---
+
+    fun selectMedia(item: MediaItem) {
+        _selectedMediaItem.value = item
+    }
+
+    fun clearSelection() {
+        _selectedMediaItem.value = null
+    }
+
+    fun playOnRenderer(renderer: Device, item: MediaItem) {
+        viewModelScope.launch {
+            try {
+                // 1. Connect to Renderer
+                DlnaManager.playback.setRenderer(renderer.deviceId)
+
+                // 2. Play
+                DlnaManager.playback.play(item)
+
+                // 3. Clear UI selection
+                clearSelection()
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
     }

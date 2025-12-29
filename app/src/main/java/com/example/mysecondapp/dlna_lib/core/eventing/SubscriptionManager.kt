@@ -8,8 +8,10 @@ import com.example.mysecondapp.dlna_lib.platform.*
 import kotlinx.coroutines.*
 import org.w3c.dom.Node
 import org.xml.sax.InputSource
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import java.io.StringReader
-import java.net.HttpURLConnection
+import java.net.Socket
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 import javax.xml.parsers.DocumentBuilderFactory
@@ -20,13 +22,8 @@ internal class SubscriptionManager(
 
     private val tag = "SubscriptionManager"
 
-    // Maps ServiceId -> Subscription Data
     private val activeSubscriptions = ConcurrentHashMap<String, SubscriptionData>()
-
-    // Maps SID (Subscription ID) -> ServiceId
     private val sidToServiceId = ConcurrentHashMap<String, String>()
-
-    // Listeners: ServiceId -> Callback function
     private val listeners = ConcurrentHashMap<String, (Map<String, String>) -> Unit>()
 
     private var renewalJob: Job? = null
@@ -90,18 +87,13 @@ internal class SubscriptionManager(
         }
     }
 
-    // --- HTTP HANDLER (Incoming NOTIFY) ---
-
     override suspend fun handle(request: HttpRequest): HttpResponse {
-        // Fix 1: Compare Enum directly
         if (request.method != HttpMethod.NOTIFY) {
-            return HttpResponse(405) // Method Not Allowed
+            return HttpResponse(405)
         }
 
-        // SID is case-insensitive in header lookup
         val sid = request.headers.entries.find { it.key.equals("SID", ignoreCase = true) }?.value ?: ""
-
-        if (sid.isEmpty()) return HttpResponse(412) // Precondition Failed
+        if (sid.isEmpty()) return HttpResponse(412)
 
         val serviceId = sidToServiceId[sid]
         if (serviceId == null) {
@@ -109,9 +101,7 @@ internal class SubscriptionManager(
             return HttpResponse(412)
         }
 
-        // Fix 2: Body is already a String, just use it
         val bodyStr = request.body ?: ""
-
         if (bodyStr.isNotEmpty()) {
             val properties = parsePropertySet(bodyStr)
             if (properties.isNotEmpty()) {
@@ -122,27 +112,23 @@ internal class SubscriptionManager(
         return HttpResponse(200)
     }
 
-    // --- Internal Logic ---
+    // --- Raw Socket Logic (Bypassing HttpURLConnection) ---
 
     private fun performSubscribe(service: Service) {
         val callbackUrl = eventServer.getCallbackUrl()
         if (callbackUrl.isEmpty()) throw Exception("Callback Server URL is invalid")
 
-        val url = URL(service.eventSubUrl)
-        val conn = url.openConnection() as HttpURLConnection
-        conn.requestMethod = "SUBSCRIBE"
-        conn.addRequestProperty("NT", "upnp:event")
-        conn.addRequestProperty("CALLBACK", "<$callbackUrl>")
-        conn.addRequestProperty("TIMEOUT", "Second-300")
-        conn.connectTimeout = 5000
+        // Use Raw Socket request to send "SUBSCRIBE" method
+        val headers = mapOf(
+            "NT" to "upnp:event",
+            "CALLBACK" to "<$callbackUrl>",
+            "TIMEOUT" to "Second-300"
+        )
 
-        val code = conn.responseCode
-        if (code != 200) {
-            throw Exception("HTTP $code")
-        }
+        val response = executeRawRequest("SUBSCRIBE", service.eventSubUrl!!, headers)
 
-        val sid = conn.getHeaderField("SID") ?: throw Exception("No SID returned")
-        val timeoutStr = conn.getHeaderField("TIMEOUT") ?: "Second-300"
+        val sid = response["SID"] ?: throw Exception("No SID returned")
+        val timeoutStr = response["TIMEOUT"] ?: "Second-300"
 
         val timeoutSeconds = try {
             timeoutStr.replace("Second-", "").trim().toInt()
@@ -162,39 +148,90 @@ internal class SubscriptionManager(
     }
 
     private fun performRenew(sub: SubscriptionData) {
-        val url = URL(sub.service.eventSubUrl)
-        val conn = url.openConnection() as HttpURLConnection
-        conn.requestMethod = "SUBSCRIBE"
-        conn.addRequestProperty("SID", sub.sid)
-        conn.addRequestProperty("TIMEOUT", "Second-300")
-
         try {
-            if (conn.responseCode == 200) {
-                val newSub = sub.copy(expirationTime = System.currentTimeMillis() + (sub.timeoutSeconds * 1000L))
-                activeSubscriptions[sub.service.serviceId] = newSub
-            } else {
-                DlnaLogger.w(tag, "Renew failed for ${sub.service.serviceId}: ${conn.responseCode}")
-                activeSubscriptions.remove(sub.service.serviceId)
-                sidToServiceId.remove(sub.sid)
-            }
+            val headers = mapOf(
+                "SID" to sub.sid,
+                "TIMEOUT" to "Second-300"
+            )
+
+            // Re-use raw request for SUBSCRIBE
+            executeRawRequest("SUBSCRIBE", sub.service.eventSubUrl!!, headers)
+
+            // Success, update time
+            val newSub = sub.copy(expirationTime = System.currentTimeMillis() + (sub.timeoutSeconds * 1000L))
+            activeSubscriptions[sub.service.serviceId] = newSub
+
         } catch (e: Exception) {
-            DlnaLogger.w(tag, "Renew error: ${e.message}")
+            DlnaLogger.w(tag, "Renew failed for ${sub.service.serviceId}: ${e.message}")
+            activeSubscriptions.remove(sub.service.serviceId)
+            sidToServiceId.remove(sub.sid)
         }
     }
 
     private fun unsubscribeInternal(sub: SubscriptionData) {
         try {
-            val url = URL(sub.service.eventSubUrl)
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "UNSUBSCRIBE"
-            conn.addRequestProperty("SID", sub.sid)
-            conn.responseCode
+            val headers = mapOf("SID" to sub.sid)
+            executeRawRequest("UNSUBSCRIBE", sub.service.eventSubUrl!!, headers)
 
-            // Clean up internal state
             activeSubscriptions.remove(sub.service.serviceId)
             sidToServiceId.remove(sub.sid)
         } catch (e: Exception) {
-            // Ignore
+            // Ignore errors on unsubscribe
+        }
+    }
+
+    /**
+     * Manually constructs an HTTP request string and sends it over a raw TCP socket.
+     * Required because HttpURLConnection throws exceptions for SUBSCRIBE/UNSUBSCRIBE methods on Android.
+     */
+    private fun executeRawRequest(method: String, urlStr: String, headers: Map<String, String>): Map<String, String> {
+        val url = URL(urlStr)
+        val port = if (url.port == -1) 80 else url.port
+        val host = url.host
+        val path = if (url.path.isEmpty()) "/" else url.path
+
+        Socket(host, port).use { socket ->
+            socket.soTimeout = 5000 // 5s timeout
+
+            val writer = socket.getOutputStream().bufferedWriter()
+
+            // 1. Write Request Line
+            writer.write("$method $path HTTP/1.1\r\n")
+
+            // 2. Write Host Header (Required)
+            writer.write("HOST: $host:$port\r\n")
+
+            // 3. Write Custom Headers
+            headers.forEach { (k, v) ->
+                writer.write("$k: $v\r\n")
+            }
+
+            // 4. End Headers
+            writer.write("Connection: Close\r\n") // Ensure connection closes
+            writer.write("\r\n")
+            writer.flush()
+
+            // 5. Read Response
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+
+            // Read Status Line
+            val statusLine = reader.readLine() ?: throw Exception("Empty response from device")
+            if (!statusLine.contains(" 200 OK")) {
+                throw Exception("HTTP Error: $statusLine")
+            }
+
+            // Read Response Headers
+            val responseHeaders = mutableMapOf<String, String>()
+            var line = reader.readLine()
+            while (!line.isNullOrBlank()) {
+                val parts = line.split(":", limit = 2)
+                if (parts.size == 2) {
+                    responseHeaders[parts[0].trim().uppercase()] = parts[1].trim()
+                }
+                line = reader.readLine()
+            }
+
+            return responseHeaders
         }
     }
 
@@ -204,7 +241,6 @@ internal class SubscriptionManager(
                 val now = System.currentTimeMillis()
                 activeSubscriptions.values.forEach { sub ->
                     val timeRemaining = sub.expirationTime - now
-                    // Renew if 50% of time has elapsed
                     if (timeRemaining < (sub.timeoutSeconds * 500)) {
                         performRenew(sub)
                     }
