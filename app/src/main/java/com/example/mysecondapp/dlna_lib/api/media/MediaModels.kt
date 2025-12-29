@@ -1,6 +1,6 @@
 package com.example.mysecondapp.dlna_lib.api.media
 
-import java.time.Duration
+import kotlin.time.Duration
 
 typealias MediaId = String
 typealias ContainerId = String
