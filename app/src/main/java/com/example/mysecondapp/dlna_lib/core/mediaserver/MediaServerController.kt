@@ -6,12 +6,13 @@ import com.example.mysecondapp.dlna_lib.core.lifecycle.dlnaScope
 import com.example.mysecondapp.dlna_lib.core.logging.DlnaLogger
 import com.example.mysecondapp.dlna_lib.platform.*
 import kotlinx.coroutines.*
-import java.io.ByteArrayInputStream
+import java.net.InetAddress
 import java.util.UUID
 import org.w3c.dom.Element
 import org.xml.sax.InputSource
 import java.io.StringReader
 import javax.xml.parsers.DocumentBuilderFactory
+import kotlin.time.Duration
 
 internal class MediaServerController(
     private val config: DlnaConfig,
@@ -21,15 +22,16 @@ internal class MediaServerController(
     private val ssdpTransport: SsdpTransport
 ) {
     private val tag = "MediaServerController"
+    // Helper to format Duration for <res> tag attribute
+    private fun formatDuration(duration: Duration): String {
+        val totalSeconds = duration.inWholeSeconds
+        val h = totalSeconds / 3600
+        val m = (totalSeconds % 3600) / 60
+        val s = totalSeconds % 60
+        return String.format("%02d:%02d:%02d", h, m, s)
+    }
 
-    // Functional Handler for streaming (Byte-Range support)
-    private val mediaHandler = MediaHttpHandler(
-        config.contentProvider!!, // Guaranteed by config check in Engine
-        config.thumbnailProvider,
-        mimeResolver
-    )
-
-    // State
+    private val mediaHandler = MediaHttpHandler(config.contentProvider!!, config.thumbnailProvider, mimeResolver)
     private var isRunning = false
     private var boundPort = 0
     private var serverUuid = "uuid:" + UUID.randomUUID().toString()
@@ -37,18 +39,12 @@ internal class MediaServerController(
 
     fun start() {
         if (isRunning) return
-
         try {
-            // 1. Start HTTP Server on random port (0)
             httpServer.start(0, ServerRouter())
             boundPort = httpServer.getPort()
             isRunning = true
-
             DlnaLogger.d(tag, "Media Server started on port $boundPort")
-
-            // 2. Start SSDP Advertising Loop
             startAdvertising()
-
         } catch (e: Exception) {
             DlnaLogger.e(tag, "Failed to start Media Server", e)
             stop()
@@ -58,47 +54,99 @@ internal class MediaServerController(
     fun stop() {
         if (!isRunning) return
         isRunning = false
-
-        // Send ByeBye before killing transport
         runBlocking { sendSsdp(alive = false) }
-
         advJob?.cancel()
         httpServer.stop()
         DlnaLogger.d(tag, "Media Server stopped")
     }
 
-    // --- 1. ROUTING LOGIC ---
+    fun respondToSearch(packet: String, address: InetAddress, port: Int) {
+        if (!isRunning) return
+
+        val ip = networkInfo.getCurrentIpAddress() ?: return
+        val location = "http://$ip:$boundPort/description.xml"
+
+        val targets = listOf(
+            "upnp:rootdevice",
+            serverUuid,
+            "urn:schemas-upnp-org:device:MediaServer:1"
+        )
+
+        dlnaScope.launch(Dispatchers.IO) {
+            targets.forEach { st ->
+                val response = """
+                    HTTP/1.1 200 OK
+                    CACHE-CONTROL: max-age=1800
+                    DATE: ${java.util.Date()}
+                    EXT:
+                    LOCATION: $location
+                    SERVER: Android/1.0 DLNA-Lib/1.0 UPnP/1.0
+                    ST: $st
+                    USN: ${if(st == serverUuid) st else "$serverUuid::$st"}
+                    
+                """.trimIndent().replace("\n", "\r\n") + "\r\n"
+
+                ssdpTransport.sendDirect(response, address, port)
+                delay(50)
+            }
+        }
+    }
 
     private inner class ServerRouter : HttpHandler {
         override suspend fun handle(request: HttpRequest): HttpResponse {
             val path = request.path
-
             return when {
-                // Device Description
                 path == "/description.xml" -> serveDescription()
 
-                // ContentDirectory Service (Browsing)
+                // FIX 1: Handle SCPD Requests (ContentDirectory)
+                path == "/scpd/ContentDirectory.xml" -> serveScpd("ContentDirectory")
+
+                // FIX 1: Handle SCPD Requests (ConnectionManager)
+                path == "/scpd/ConnectionManager.xml" -> serveScpd("ConnectionManager")
+
                 path == "/soap/ContentDirectory" -> handleContentDirectory(request)
-
-                // ConnectionManager Service (Minimal stub)
                 path == "/soap/ConnectionManager" -> handleConnectionManager(request)
-
-                // Media Streaming & Thumbnails (Delegate)
                 path.startsWith("/content/") || path.startsWith("/thumb/") -> mediaHandler.handle(request)
-
                 else -> HttpResponse(404)
             }
         }
     }
 
-    // --- 2. DEVICE DESCRIPTION ---
+    // FIX 1: New function to serve minimal SCPD XML
+    private fun serveScpd(serviceName: String): HttpResponse {
+        val serviceType = "urn:schemas-upnp-org:service:$serviceName:1"
+
+        // Minimal valid SCPD XML with only mandatory tags
+        val xml = "<?xml version=\"1.0\"?>\n" +
+                """
+            <scpd xmlns="urn:schemas-upnp-org:service-1-0">
+                <specVersion>
+                    <major>1</major>
+                    <minor>0</minor>
+                </specVersion>
+                <actionList>
+                    ${if (serviceName == "ContentDirectory") """
+                        <action><name>Browse</name></action>
+                        <action><name>GetSearchCapabilities</name></action>
+                        <action><name>GetSortCapabilities</name></action>
+                    """ else ""}
+                </actionList>
+                <serviceStateTable>
+                    <stateVariable sendEvents="yes">
+                        <name>LastChange</name>
+                        <dataType>string</dataType>
+                    </stateVariable>
+                </serviceStateTable>
+            </scpd>
+        """.trimIndent()
+
+        return HttpResponse(200, mimeType = "text/xml", body = xml)
+    }
 
     private fun serveDescription(): HttpResponse {
         val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
-        val baseUrl = "http://$ip:$boundPort"
-
-        val xml = """
-            <?xml version="1.0"?>
+        val xml = "<?xml version=\"1.0\"?>\n" +
+                """
             <root xmlns="urn:schemas-upnp-org:device-1-0">
                 <specVersion><major>1</major><minor>0</minor></specVersion>
                 <device>
@@ -127,48 +175,29 @@ internal class MediaServerController(
             </root>
         """.trimIndent()
 
-        return HttpResponse(
-            statusCode = 200,
-            mimeType = "text/xml",
-            body = xml
-        )
+        return HttpResponse(200, mimeType = "text/xml", body = xml)
     }
-
-    // --- 3. SOAP HANDLERS ---
 
     private suspend fun handleContentDirectory(request: HttpRequest): HttpResponse {
         if (request.method != HttpMethod.POST) return HttpResponse(405)
-
         val soapAction = request.headers.entries.find { it.key.equals("SOAPAction", ignoreCase = true) }?.value
-            ?.replace("\"", "") // Remove quotes: "urn:..." -> urn:...
-            ?: return HttpResponse(400)
+            ?.replace("\"", "") ?: return HttpResponse(400)
 
-        // We only really support Browse
-        if (soapAction.endsWith("Browse")) {
-            return handleBrowse(request)
-        }
-
+        if (soapAction.endsWith("Browse")) return handleBrowse(request)
         return HttpResponse(500, body = soapError("InvalidAction"))
     }
 
     private suspend fun handleBrowse(request: HttpRequest): HttpResponse {
         val body = request.body ?: return HttpResponse(400)
-
-        // Parse Arguments
         val args = parseSoapBody(body)
         val objectId = args["ObjectID"] ?: "0"
         val startIndex = args["StartingIndex"]?.toIntOrNull() ?: 0
         val count = args["RequestedCount"]?.toIntOrNull() ?: 20
 
         try {
-            // Fetch from App Provider
             val list = config.contentProvider?.list(objectId) ?: emptyList()
-
-            // Pagination logic
             val totalMatches = list.size
-            val slicedList = if (count == 0) list else list.drop(startIndex).take(count) // 0 means all
-
-            // Convert to DIDL
+            val slicedList = if (count == 0) list else list.drop(startIndex).take(count)
             val didlXml = generateDidl(slicedList)
             val numberReturned = slicedList.size
 
@@ -182,7 +211,6 @@ internal class MediaServerController(
             """.trimIndent()
 
             return HttpResponse(200, mimeType = "text/xml", body = wrapSoap(responseBody))
-
         } catch (e: Exception) {
             DlnaLogger.e(tag, "Browse Error", e)
             return HttpResponse(500, body = soapError("ActionFailed"))
@@ -190,7 +218,6 @@ internal class MediaServerController(
     }
 
     private fun handleConnectionManager(request: HttpRequest): HttpResponse {
-        // Just return minimal valid info for GetProtocolInfo
         val body = """
             <u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
                 <Source>http-get:*:*:*</Source>
@@ -200,12 +227,10 @@ internal class MediaServerController(
         return HttpResponse(200, mimeType = "text/xml", body = wrapSoap(body))
     }
 
-    // --- 4. DIDL GENERATION ---
-
+    // FIX 2: Generate metadata with DLNA Flags and ALL <res> ATTRIBUTES
     private fun generateDidl(items: List<MediaObject>): String {
         val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
         val baseUrl = "http://$ip:$boundPort"
-
         val sb = StringBuilder()
         sb.append("""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">""")
 
@@ -221,38 +246,39 @@ internal class MediaServerController(
                 sb.append("</container>")
             } else if (obj is MediaItem) {
                 val upnpClass = obj.upnpClass
+                val res = obj.resources.firstOrNull()
+                val mime = res?.mimeType ?: "application/octet-stream"
+                val url = "$baseUrl/content/${id}"
 
-                // Assume one main resource for now.
-                // Note: ProtocolInfo must match what we serve (http-get:*:mime:*)
-                val mime = obj.resources.firstOrNull()?.mimeType ?: "application/octet-stream"
-                val url = "$baseUrl/content/${id}" // We generate the URL pointing to OURSELVES
+                val sizeAttr = if (res?.size != null) """ size="${res.size}"""" else ""
+                val durAttr = if (res?.duration != null) """ duration="${formatDuration(res.duration)}"""" else ""
+                val resAttr = if (res?.resolution != null) """ resolution="${res.resolution}"""" else ""
+
+                val flags = "DLNA.ORG_PN=*;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+                val protocolInfo = "http-get:*:$mime:$flags"
 
                 sb.append("""<item id="$id" parentID="$parent" restricted="1">""")
                 sb.append("<dc:title>$title</dc:title>")
                 sb.append("<upnp:class>$upnpClass</upnp:class>")
-                sb.append("""<res protocolInfo="http-get:*:$mime:*">$url</res>""")
 
-                // Add thumbnail if exists
+                sb.append("""<res protocolInfo="$protocolInfo"$sizeAttr$durAttr$resAttr>$url</res>""")
+
                 if (config.thumbnailProvider != null) {
                     val thumbUrl = "$baseUrl/thumb/${id}"
                     sb.append("<upnp:albumArtURI>$thumbUrl</upnp:albumArtURI>")
                 }
-
                 sb.append("</item>")
             }
         }
-
         sb.append("</DIDL-Lite>")
         return sb.toString()
     }
-
-    // --- 5. SSDP ADVERTISING ---
 
     private fun startAdvertising() {
         advJob = dlnaScope.launch(Dispatchers.IO) {
             while (isActive) {
                 sendSsdp(alive = true)
-                delay(10_000) // Announce every 10 seconds (aggressive for discovery)
+                delay(10_000)
             }
         }
     }
@@ -261,50 +287,30 @@ internal class MediaServerController(
         val ip = networkInfo.getCurrentIpAddress() ?: return
         val location = "http://$ip:$boundPort/description.xml"
         val nts = if (alive) "ssdp:alive" else "ssdp:byebye"
-
-        // We must announce 3 targets: Root, DeviceUUID, DeviceType
-        val targets = listOf(
-            "upnp:rootdevice",
-            serverUuid,
-            "urn:schemas-upnp-org:device:MediaServer:1"
-        )
+        val targets = listOf("upnp:rootdevice", serverUuid, "urn:schemas-upnp-org:device:MediaServer:1")
 
         targets.forEach { nt ->
-            val packet = buildSsdpPacket(nt, serverUuid, location, nts)
-            try {
-                ssdpTransport.send(packet)
-            } catch (e: Exception) {
-                // Ignore send errors
-            }
+            val usn = if (nt == serverUuid) serverUuid else "$serverUuid::$nt"
+            val packet = """
+                NOTIFY * HTTP/1.1
+                HOST: 239.255.255.250:1900
+                CACHE-CONTROL: max-age=1800
+                LOCATION: $location
+                NT: $nt
+                NTS: $nts
+                SERVER: Android/1.0 DLNA-Lib/1.0 UPnP/1.0
+                USN: $usn
+                
+            """.trimIndent().replace("\n", "\r\n")
+            try { ssdpTransport.send(packet) } catch (e: Exception) {}
         }
     }
 
-    private fun buildSsdpPacket(nt: String, usnUuid: String, location: String, nts: String): String {
-        // USN format: uuid:device-UUID::urn:device-type... or just uuid:device-UUID
-        val usn = if (nt == usnUuid) usnUuid else "$usnUuid::$nt"
-
-        return """
-            NOTIFY * HTTP/1.1
-            HOST: 239.255.255.250:1900
-            CACHE-CONTROL: max-age=1800
-            LOCATION: $location
-            NT: $nt
-            NTS: $nts
-            SERVER: Android/1.0 DLNA-Lib/1.0 UPnP/1.0
-            USN: $usn
-            
-        """.trimIndent().replace("\n", "\r\n")
-    }
-
-    // --- HELPERS ---
-
     private fun wrapSoap(innerXml: String): String {
-        return """
-            <?xml version="1.0"?>
-            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-                <s:Body>$innerXml</s:Body>
-            </s:Envelope>
-        """.trimIndent()
+        return "<?xml version=\"1.0\"?>\n" +
+                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\n" +
+                "    <s:Body>$innerXml</s:Body>\n" +
+                "</s:Envelope>"
     }
 
     private fun soapError(code: String): String {
@@ -330,30 +336,20 @@ internal class MediaServerController(
             val builder = factory.newDocumentBuilder()
             val doc = builder.parse(InputSource(StringReader(xml)))
             doc.documentElement.normalize()
-
-            // Look for specific arguments we know (ObjectID, etc) inside Body
-            // A generic traversal is safer
             val body = doc.getElementsByTagNameNS("*", "Body").item(0) as? Element
-            val action = body?.childNodes?.item(1) as? Element // First child is the Action
-
+            val action = body?.childNodes?.item(1) as? Element
             if (action != null) {
                 val children = action.childNodes
                 for (i in 0 until children.length) {
                     val node = children.item(i)
-                    if (node is Element) {
-                        map[node.localName] = node.textContent
-                    }
+                    if (node is Element) map[node.localName] = node.textContent
                 }
             }
-        } catch (e: Exception) { /* ignore */ }
+        } catch (e: Exception) { }
         return map
     }
 
     private fun escapeXml(input: String): String {
-        return input.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\"", "&quot;")
-            .replace("'", "&apos;")
+        return input.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&apos;")
     }
 }

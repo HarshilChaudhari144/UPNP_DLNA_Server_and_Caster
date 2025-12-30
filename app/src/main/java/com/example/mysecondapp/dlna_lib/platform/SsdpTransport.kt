@@ -1,20 +1,23 @@
 package com.example.mysecondapp.dlna_lib.platform
 
+import java.net.InetAddress
+
 interface SsdpTransport {
     /**
-     * Sends an SSDP message (e.g., M-SEARCH or NOTIFY) to the multicast group.
+     * Sends a Multicast packet (Standard usage).
      */
     fun send(data: String)
 
     /**
-     * Starts listening for incoming SSDP packets.
-     * @param onReceive Callback triggered whenever a packet arrives.
-     * Provides the raw packet data and the sender's address.
+     * Sends a Unicast packet to a specific IP and Port (For replying to M-SEARCH).
      */
-    fun listen(onReceive: (data: String, remoteAddress: String) -> Unit)
+    fun sendDirect(data: String, address: InetAddress, port: Int)
 
     /**
-     * Stops the UDP listener and releases the socket.
+     * Starts listening.
+     * Callback now includes the sender's Port and full InetAddress.
      */
+    fun listen(onReceive: (data: String, address: InetAddress, port: Int) -> Unit)
+
     fun stop()
 }

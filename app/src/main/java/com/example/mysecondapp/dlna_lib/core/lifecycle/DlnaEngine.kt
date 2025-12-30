@@ -67,6 +67,15 @@ internal class DlnaEngine(
         )
     } else null
 
+    // --- 4. Initialization Wiring ---
+    init {
+        // Wire up Search Responses:
+        // When SsdpController hears "M-SEARCH" from a TV, tell the Media Server to reply "I am here!"
+        ssdpController.onSearchReceived = { packet, address, port ->
+            mediaServerController?.respondToSearch(packet, address, port)
+        }
+    }
+
     fun start() {
         DlnaLogger.d(tag, "Engine Starting...")
 
