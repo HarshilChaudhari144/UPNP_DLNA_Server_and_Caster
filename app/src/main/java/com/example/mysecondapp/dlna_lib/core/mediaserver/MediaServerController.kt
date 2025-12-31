@@ -1,12 +1,12 @@
 package com.example.mysecondapp.dlna_lib.core.mediaserver
 
+import android.util.Log
 import com.example.mysecondapp.dlna_lib.api.DlnaConfig
 import com.example.mysecondapp.dlna_lib.api.media.*
 import com.example.mysecondapp.dlna_lib.core.lifecycle.dlnaScope
 import com.example.mysecondapp.dlna_lib.core.logging.DlnaLogger
 import com.example.mysecondapp.dlna_lib.platform.*
 import kotlinx.coroutines.*
-import java.io.ByteArrayInputStream
 import java.util.UUID
 import org.w3c.dom.Element
 import org.xml.sax.InputSource
@@ -25,14 +25,16 @@ internal class MediaServerController(
     // Functional Handler for streaming (Byte-Range support)
     private val mediaHandler = MediaHttpHandler(
         config.contentProvider!!, // Guaranteed by config check in Engine
-        config.thumbnailProvider,
-        mimeResolver
+        config.thumbnailProvider
     )
 
     // State
     private var isRunning = false
     private var boundPort = 0
-    private var serverUuid = "uuid:" + UUID.randomUUID().toString()
+
+    // CHANGE: Use UDN from config. Ensure it starts with "uuid:"
+    private val serverUuid = if (config.serverUdn.startsWith("uuid:")) config.serverUdn else "uuid:${config.serverUdn}"
+
     private var advJob: Job? = null
 
     fun start() {
@@ -44,7 +46,7 @@ internal class MediaServerController(
             boundPort = httpServer.getPort()
             isRunning = true
 
-            DlnaLogger.d(tag, "Media Server started on port $boundPort")
+            DlnaLogger.d(tag, "Media Server started on port $boundPort with UDN: $serverUuid")
 
             // 2. Start SSDP Advertising Loop
             startAdvertising()
@@ -95,7 +97,7 @@ internal class MediaServerController(
 
     private fun serveDescription(): HttpResponse {
         val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
-        val baseUrl = "http://$ip:$boundPort"
+        // Note: Using the actual UUID for the device ensures consistency
 
         val xml = """
             <?xml version="1.0"?>
@@ -221,23 +223,35 @@ internal class MediaServerController(
                 sb.append("</container>")
             } else if (obj is MediaItem) {
                 val upnpClass = obj.upnpClass
+                val resource = obj.resources.firstOrNull()
+                val mime = resource?.mimeType ?: "application/octet-stream"
 
-                // Assume one main resource for now.
-                // Note: ProtocolInfo must match what we serve (http-get:*:mime:*)
-                val mime = obj.resources.firstOrNull()?.mimeType ?: "application/octet-stream"
-                val url = "$baseUrl/content/${id}" // We generate the URL pointing to OURSELVES
+                // CHANGE 1: Append the actual filename (or safe title) to the URL.
+                // This matches your Reference File logic (Line 173).
+                // Result: http://.../content/123/MyMovie.mp4
+                Log.d("MediaServerController", "from generateDidl(), mime: ${mime}")
+                val safeTitle = obj.title.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
+                Log.d("MediaServerController", "from generateDidl(), safeTitle: ${safeTitle}")
+                val extension = if (mime.contains("video")) ".mp4" else if (mime.contains("audio")) ".mp3" else ".jpg"
+//                val finalName = if (safeTitle.endsWith(extension)) safeTitle else "$safeTitle$extension"
+                val finalName = safeTitle
+                Log.d("MediaServerController", "from generateDidl(), finalName: ${finalName}")
+
+                val url = "$baseUrl/content/$id/$finalName"
 
                 sb.append("""<item id="$id" parentID="$parent" restricted="1">""")
                 sb.append("<dc:title>$title</dc:title>")
                 sb.append("<upnp:class>$upnpClass</upnp:class>")
-                sb.append("""<res protocolInfo="http-get:*:$mime:*">$url</res>""")
 
-                // Add thumbnail if exists
+                // CHANGE 2: Use OP=01 (Byte Seek) to match Reference File Line 99
+                val dlnaFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+
+                sb.append("""<res protocolInfo="http-get:*:$mime:$dlnaFlags">$url</res>""")
+
                 if (config.thumbnailProvider != null) {
                     val thumbUrl = "$baseUrl/thumb/${id}"
                     sb.append("<upnp:albumArtURI>$thumbUrl</upnp:albumArtURI>")
                 }
-
                 sb.append("</item>")
             }
         }
@@ -299,12 +313,10 @@ internal class MediaServerController(
     // --- HELPERS ---
 
     private fun wrapSoap(innerXml: String): String {
-        return """
-            <?xml version="1.0"?>
-            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-                <s:Body>$innerXml</s:Body>
-            </s:Envelope>
-        """.trimIndent()
+        return """<?xml version="1.0"?>
+                  <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+                    <s:Body>$innerXml</s:Body>
+                  </s:Envelope>""".trimIndent()
     }
 
     private fun soapError(code: String): String {

@@ -79,19 +79,23 @@ internal class PlaybackController(
         val device = getActiveDevice()
         val avTransport = getAVTransport(device)
 
+        // Stop first to ensure clean state
         try { stop() } catch (e: Exception) { /* Ignore */ }
 
         val resource = mediaItem.resources.firstOrNull()
             ?: throw DlnaError.Playback("MediaItem has no playable resources")
 
+        // FIX: Proper metadata generation
         val metadata = buildDidlMetadata(mediaItem)
 
+        // 1. Set URI (Crucial Step)
         executeSoap(avTransport, "SetAVTransportURI", mapOf(
             "InstanceID" to "0",
             "CurrentURI" to resource.uri,
             "CurrentURIMetaData" to metadata
         ))
 
+        // 2. Play
         executeSoap(avTransport, "Play", mapOf(
             "InstanceID" to "0",
             "Speed" to speed
@@ -116,7 +120,8 @@ internal class PlaybackController(
 
     override suspend fun pause() {
         val device = getActiveDevice()
-        executeSoap(getAVTransport(device), "Pause", mapOf("InstanceID" to "0"))
+        // FIX: Don't crash on pause failure (Error 701)
+        executeSoap(getAVTransport(device), "Pause", mapOf("InstanceID" to "0"), ignoreErrors = true)
         _playbackState.update { it.copy(transportState = TransportState.PAUSED_PLAYBACK) }
         stopPolling()
     }
@@ -124,7 +129,8 @@ internal class PlaybackController(
     override suspend fun stop() {
         if (currentDeviceId == null) return
         val device = getActiveDevice()
-        executeSoap(getAVTransport(device), "Stop", mapOf("InstanceID" to "0"))
+        // FIX: Don't crash on stop failure
+        executeSoap(getAVTransport(device), "Stop", mapOf("InstanceID" to "0"), ignoreErrors = true)
         _playbackState.update { it.copy(transportState = TransportState.STOPPED) }
         stopPolling()
     }
@@ -140,11 +146,12 @@ internal class PlaybackController(
 
         val target = formatDuration(position)
 
+        // FIX: Don't crash on seek failure (Error 701 or 710)
         executeSoap(getAVTransport(device), "Seek", mapOf(
             "InstanceID" to "0",
             "Unit" to "REL_TIME",
             "Target" to target
-        ))
+        ), ignoreErrors = true)
 
         _playbackState.update { it.copy(position = position) }
     }
@@ -155,7 +162,7 @@ internal class PlaybackController(
             "InstanceID" to "0",
             "Unit" to "ABS_COUNT",
             "Target" to byteOffset.toString()
-        ))
+        ), ignoreErrors = true)
     }
 
     override suspend fun setVolume(volume: Int) {
@@ -165,7 +172,7 @@ internal class PlaybackController(
             "InstanceID" to "0",
             "Channel" to "Master",
             "DesiredVolume" to volume.toString()
-        ))
+        ), ignoreErrors = true)
         _playbackState.update { it.copy(volume = volume) }
     }
 
@@ -176,7 +183,7 @@ internal class PlaybackController(
             "InstanceID" to "0",
             "Channel" to "Master",
             "DesiredMute" to if (muted) "1" else "0"
-        ))
+        ), ignoreErrors = true)
         _playbackState.update { it.copy(muted = muted) }
     }
 
@@ -219,7 +226,7 @@ internal class PlaybackController(
                     val result = didlParser.parse(unescaped)
                     mediaItem = result.items.firstOrNull()
 
-                    // Fallback: If XML parser failed to find title (due to namespaces/entities), use Dirty Parse
+                    // Fallback: If XML parser failed to find title
                     if (mediaItem == null || mediaItem.title == "Unknown Item") {
                         val fallbackTitle = dirtyExtractTitle(unescaped)
                         if (fallbackTitle != null) {
@@ -309,9 +316,7 @@ internal class PlaybackController(
                         it.copy(
                             transportState = transportState,
                             position = position,
-                            // Only update duration if valid, otherwise keep existing
                             duration = if (duration != null && duration.inWholeSeconds > 0) duration else it.duration,
-                            // Only update volume/mute if we successfully polled them
                             volume = volume ?: it.volume,
                             muted = muted ?: it.muted
                         )
@@ -391,14 +396,20 @@ internal class PlaybackController(
             ?: throw DlnaError.Playback("Device lacks RenderingControl service")
     }
 
-    private suspend fun executeSoap(service: Service, action: String, args: Map<String, String>) {
+    // FIX: Added ignoreErrors flag
+    private suspend fun executeSoap(service: Service, action: String, args: Map<String, String>, ignoreErrors: Boolean = false) {
         try {
             soapClient.sendAction(service.controlUrl, service.serviceType, action, args)
         } catch (t: Throwable) {
-            throw PublicErrorMapper.mapToPlaybackError(t, action)
+            if (!ignoreErrors) {
+                throw PublicErrorMapper.mapToPlaybackError(t, action)
+            } else {
+                DlnaLogger.w(tag, "Action $action failed (Ignored): ${t.message}")
+            }
         }
     }
 
+    // FIX: Completely rewritten to generate valid escaped XML
     private fun buildDidlMetadata(item: MediaItem): String {
         val title = escapeXml(item.title)
         val id = escapeXml(item.id)
@@ -408,22 +419,29 @@ internal class PlaybackController(
         val protocolInfo = patchProtocolInfo(rawProtocol)
         val uri = item.resources.firstOrNull()?.uri ?: ""
 
-        return """
-            <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dc="http://purl.org/dc/elements/1.1/">
-                <item id="$id" parentID="$parent" restricted="1">
-                    <dc:title>$title</dc:title>
-                    <upnp:class>$upnpClass</upnp:class>
-                    <res protocolInfo="$protocolInfo">$uri</res>
-                </item>
-            </DIDL-Lite>
-        """.trimIndent().replace("\"", "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+        // 1. Build the Inner XML (Clean)
+        val innerXml = """
+<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <item id="$id" parentID="$parent" restricted="1">
+        <dc:title>$title</dc:title>
+        <upnp:class>$upnpClass</upnp:class>
+        <res protocolInfo="$protocolInfo">$uri</res>
+    </item>
+</DIDL-Lite>
+        """.trim()
+
+        // 2. Escape it for the SOAP XML envelope (Client-side)
+        return escapeXml(innerXml)
     }
 
     private fun patchProtocolInfo(info: String): String {
+        // Essential flags to tell TV "I support seeking and time-based operations"
+        // DLNA.ORG_OP=01 (Seek Range), DLNA.ORG_OP=10 (Seek Time) -> 11 = Both
+        // Using 01 (Range) is safest for generic Android servers
         if (info.contains("DLNA.ORG_OP")) return info
         val parts = info.split(":")
         if (parts.size < 3) return info
-        val flags = "DLNA.ORG_PN=AVC_TS_MP_HD_AAC_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+        val flags = "DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
         return "${parts[0]}:${parts[1]}:${parts[2]}:$flags"
     }
 
@@ -450,14 +468,12 @@ internal class PlaybackController(
         return map
     }
 
-    // FIX: Updated regex to be more permissive with spacing/attributes
     private fun extractValueRegex(xml: String, tagName: String): String? {
         val regex = Regex("<([a-zA-Z0-9]+:)?$tagName(?:\\s[^>]*)?>(.*?)</([a-zA-Z0-9]+:)?$tagName>", RegexOption.DOT_MATCHES_ALL)
         val match = regex.find(xml)
         return match?.groupValues?.get(2)?.trim()
     }
 
-    // Fallback parser using Regex to find title if XML parsing fails
     private fun dirtyExtractTitle(xml: String): String? {
         val regex = Regex("<(dc:)?title>(.*?)</(dc:)?title>", RegexOption.IGNORE_CASE)
         return regex.find(xml)?.groupValues?.get(2)?.trim()

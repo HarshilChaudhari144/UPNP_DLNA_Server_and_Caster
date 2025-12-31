@@ -66,18 +66,28 @@ internal class DidlLiteParser {
      * 2. Wraps in <DIDL-Lite> if it's a fragment.
      */
     private fun prepareXml(raw: String): String {
+        // TRIM FIRST
         var xml = raw.trim()
 
         // Step 1: Check if double-escaped (common in GetMediaInfo responses)
-        // If it starts with "&lt;", it means it's an escaped string, not XML yet.
         if (xml.startsWith("&lt;")) {
             xml = unescapeXml(xml)
         }
 
-        // Step 2: Check for Root Element
-        // Some servers return just "<item>...</item>" without the namespace wrapper.
+        // TRIM AGAIN (Vital fix: unescaping might leave whitespace before <?xml)
+        xml = xml.trim()
+
+        // Step 2: Remove <?xml ... ?> declaration if it exists inside the fragment
+        // (Nested declarations cause parser errors)
+        if (xml.startsWith("<?xml")) {
+            val endDecl = xml.indexOf("?>")
+            if (endDecl != -1) {
+                xml = xml.substring(endDecl + 2).trim()
+            }
+        }
+
+        // Step 3: Check for Root Element
         if (!xml.contains("<DIDL-Lite", ignoreCase = true) && !xml.contains(":DIDL-Lite", ignoreCase = true)) {
-            // Wrap it in a standard root with namespaces to make it valid XML
             return """
                 <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" 
                            xmlns:dc="http://purl.org/dc/elements/1.1/" 

@@ -22,7 +22,11 @@ interface MediaContentProvider {
  * Abstraction for reading file data, allowing for range-based (seeking) requests.
  */
 interface MediaDataSource {
+    /** The total size of the content in bytes. */
     val size: Long
+
+    /** The MIME type of the content (e.g., "video/mp4"). Essential for TV compatibility. */
+    val contentType: String
 
     /** Returns a stream for the entire file. */
     fun openFull(): InputStream

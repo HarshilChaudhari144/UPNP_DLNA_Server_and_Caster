@@ -1,5 +1,6 @@
 package com.example.mysecondapp.dlna_lib.core.browse
 
+import android.util.Log
 import com.example.mysecondapp.dlna_lib.api.browse.BrowseApi
 import com.example.mysecondapp.dlna_lib.api.browse.BrowseResult
 import com.example.mysecondapp.dlna_lib.api.device.Device
@@ -51,7 +52,8 @@ internal class BrowseController(
                 actionName = "Browse",
                 arguments = args
             )
-
+            Log.d("BrowseController", "The response being sent to parseBrowseResponse():")
+            Log.d("BrowseController", responseXml)
             // 2. Parse Outer SOAP to get the <Result> string
             return parseBrowseResponse(responseXml)
 
@@ -72,16 +74,17 @@ internal class BrowseController(
     }
 
     private fun parseBrowseResponse(soapXml: String): BrowseResult {
+        // FIX: trim() is essential. XML Parsers crash if there is whitespace before <?xml
+        val cleanXml = soapXml.trim()
+
         // We need to extract: Result, TotalMatches, NumberReturned
         val factory = DocumentBuilderFactory.newInstance()
         factory.isNamespaceAware = true
         val builder = factory.newDocumentBuilder()
-        val doc = builder.parse(InputSource(StringReader(soapXml)))
-        doc.documentElement.normalize()
 
-        // Helper to find text inside <Result> or <TotalMatches>
-        // These tags are usually inside <u:BrowseResponse>
-        // We scan all tags because namespaces vary
+        // Use cleanXml here
+        val doc = builder.parse(InputSource(StringReader(cleanXml)))
+        doc.documentElement.normalize()
 
         val resultStr = getTagContent(doc.documentElement, "Result") ?: ""
         val totalMatchesStr = getTagContent(doc.documentElement, "TotalMatches") ?: "0"

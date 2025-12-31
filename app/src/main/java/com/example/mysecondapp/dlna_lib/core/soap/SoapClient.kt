@@ -1,5 +1,6 @@
 package com.example.mysecondapp.dlna_lib.core.soap
 
+import android.util.Log
 import com.example.mysecondapp.dlna_lib.api.errors.DlnaError
 import com.example.mysecondapp.dlna_lib.core.error.PublicErrorMapper
 import com.example.mysecondapp.dlna_lib.core.logging.DlnaLogger
@@ -44,6 +45,10 @@ internal class SoapClient {
         val soapActionHeader = "\"$serviceType#$actionName\""
 
         DlnaLogger.d(tag, "Sending $actionName to $urlStr")
+        Log.d("SoapClient", "Soap Body:")
+        Log.d("SoapClient", soapBody)
+        Log.d("SoapClient", "Soap action header:")
+        Log.d("SoapClient", soapActionHeader)
 
         val url = URL(urlStr)
         val conn = url.openConnection() as HttpURLConnection
@@ -75,15 +80,13 @@ internal class SoapClient {
 
     private fun buildSoapBody(serviceType: String, action: String, args: Map<String, String>): String {
         val argsXml = args.entries.joinToString("") { "<${it.key}>${it.value}</${it.key}>" }
-        return """
-            <?xml version="1.0"?>
+        return """<?xml version="1.0"?>
             <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
                 <s:Body>
                     <u:$action xmlns:u="$serviceType">
                         $argsXml
                     </u:$action>
                 </s:Body>
-            </s:Envelope>
-        """.trimIndent()
+            </s:Envelope>""".trimIndent()
     }
 }

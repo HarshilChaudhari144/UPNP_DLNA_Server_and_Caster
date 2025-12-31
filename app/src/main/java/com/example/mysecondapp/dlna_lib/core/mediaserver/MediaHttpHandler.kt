@@ -7,25 +7,20 @@ import com.example.mysecondapp.dlna_lib.platform.HttpHandler
 import com.example.mysecondapp.dlna_lib.platform.HttpMethod
 import com.example.mysecondapp.dlna_lib.platform.HttpRequest
 import com.example.mysecondapp.dlna_lib.platform.HttpResponse
-import com.example.mysecondapp.dlna_lib.platform.MimeTypeResolver
-import java.io.InputStream
-import kotlin.math.min
 
 internal class MediaHttpHandler(
     private val contentProvider: MediaContentProvider,
-    private val thumbnailProvider: MediaThumbnailProvider?,
-    private val mimeResolver: MimeTypeResolver
+    private val thumbnailProvider: MediaThumbnailProvider?
 ) : HttpHandler {
 
     private val tag = "MediaHttpHandler"
 
-    // URL Patterns:
-    // Content: /content/<mediaId>
-    // Thumbnail: /thumb/<mediaId>
+    // Matches Reference: OP=01 (Byte Seek)
+    private val dlnaFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
     override suspend fun handle(request: HttpRequest): HttpResponse {
         if (request.method != HttpMethod.GET && request.method != HttpMethod.HEAD) {
-            return HttpResponse(405) // Method Not Allowed
+            return HttpResponse(405)
         }
 
         val path = request.path
@@ -36,63 +31,50 @@ internal class MediaHttpHandler(
         }
     }
 
-    private fun handleContent(request: HttpRequest, mediaIdRaw: String): HttpResponse {
-        // Some clients append /filename.ext to the URL, strip it if necessary to get ID
-        // Assuming simple ID for now, or decode URL if needed.
-        val mediaId = mediaIdRaw.split("/").first()
+    private fun handleContent(request: HttpRequest, pathRaw: String): HttpResponse {
+        val mediaId = pathRaw.split("/").first()
 
         try {
             val dataSource = contentProvider.openMedia(mediaId)
             val totalSize = dataSource.size
-            val rangeHeader = request.headers.entries
-                .find { it.key.equals("Range", ignoreCase = true) }?.value
+            val mimeType = dataSource.contentType
+            val rangeHeader = request.headers.entries.find { it.key.equals("Range", ignoreCase = true) }?.value
 
-            // Resolve MimeType (Best effort: try file extension if ID has one, else guess)
-            // Ideally, contentProvider could return mimeType, but for now we rely on Resolver or default.
-            val mimeType = mimeResolver.getMimeType(mediaId) ?: "application/octet-stream"
+            // 1. Check for Range Request
+            if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+                val range = parseRange(rangeHeader, totalSize)
+                if (range != null) {
+                    val (start, end) = range
+                    val length = end - start + 1
 
-            // 1. Full Content Request (No Range)
-            if (rangeHeader == null) {
-                val stream = if (request.method == HttpMethod.GET) dataSource.openFull() else null
-                return HttpResponse(
-                    statusCode = 200,
-                    mimeType = mimeType,
-                    headers = mapOf(
-                        "Content-Length" to totalSize.toString(),
-                        "Accept-Ranges" to "bytes",
-                        "Content-Features.DLNA.ORG" to "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
-                    ),
-                    inputStream = stream,
-                    contentLength = totalSize
-                )
+                    return HttpResponse(
+                        statusCode = 206, // Partial Content
+                        mimeType = mimeType,
+                        headers = mapOf(
+                            "Content-Range" to "bytes $start-$end/$totalSize",
+                            "Content-Length" to length.toString(),
+                            "Accept-Ranges" to "bytes",
+                            "contentFeatures.dlna.org" to dlnaFlags,
+                            "transferMode.dlna.org" to "Streaming"
+                        ),
+                        inputStream = dataSource.openRange(start, length),
+                        contentLength = length
+                    )
+                }
             }
 
-            // 2. Range Request (Seeking)
-            val range = parseRange(rangeHeader, totalSize)
-            if (range == null) {
-                return HttpResponse(416) // Range Not Satisfiable
-            }
-
-            val (start, end) = range
-            val length = end - start + 1
-
-            val stream = if (request.method == HttpMethod.GET) {
-                dataSource.openRange(start, length)
-            } else null
-
+            // 2. Full Content / Fallback
             return HttpResponse(
-                statusCode = 206, // Partial Content
+                statusCode = 200,
                 mimeType = mimeType,
                 headers = mapOf(
-                    "Content-Range" to "bytes $start-$end/$totalSize",
-                    "Content-Length" to length.toString(),
+                    "Content-Length" to totalSize.toString(),
                     "Accept-Ranges" to "bytes",
-                    // DLNA operations: 01 = Seek (Range) supported, 10 = Time seek supported
-                    "Content-Features.DLNA.ORG" to "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+                    "contentFeatures.dlna.org" to dlnaFlags,
                     "transferMode.dlna.org" to "Streaming"
                 ),
-                inputStream = stream,
-                contentLength = length
+                inputStream = dataSource.openFull(),
+                contentLength = totalSize
             )
 
         } catch (e: Exception) {
@@ -105,7 +87,6 @@ internal class MediaHttpHandler(
         if (thumbnailProvider == null) return HttpResponse(404)
 
         try {
-            // Default sizes, could parse from query params if needed
             val result = thumbnailProvider.openThumbnail(mediaId, 320, 320)
                 ?: return HttpResponse(404)
 
@@ -128,10 +109,6 @@ internal class MediaHttpHandler(
         }
     }
 
-    /**
-     * Parses "bytes=0-499" or "bytes=500-"
-     * Returns Pair(start, end) or null if invalid.
-     */
     private fun parseRange(header: String, totalSize: Long): Pair<Long, Long>? {
         try {
             val prefix = "bytes="

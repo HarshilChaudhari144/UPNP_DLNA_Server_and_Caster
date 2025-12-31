@@ -2,6 +2,7 @@ package com.example.mysecondapp
 
 import android.Manifest
 import android.app.Application
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -37,6 +38,7 @@ import com.example.mysecondapp.dlna_lib.api.DlnaConfig
 import com.example.mysecondapp.dlna_lib.api.DlnaManager
 import com.example.mysecondapp.dlna_lib.api.browse.BrowseResult
 import com.example.mysecondapp.dlna_lib.api.device.Device
+import com.example.mysecondapp.dlna_lib.api.media.MediaContainer
 import com.example.mysecondapp.dlna_lib.api.media.MediaItem
 import com.example.mysecondapp.dlna_lib.api.playback.PlaybackState
 import com.example.mysecondapp.dlna_lib.api.playback.TransportState
@@ -46,6 +48,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.UUID
 import kotlin.time.Duration.Companion.seconds
 
 class MainActivity : ComponentActivity() {
@@ -57,14 +60,20 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-enum class Screen { DEVICE_LIST, BROWSER, REMOTE_CONTROL }
+enum class Screen { DEVICE_LIST, BROWSER, REMOTE_CONTROL, SERVER_SETTINGS }
 
 @Composable
 fun DlnaApp() {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            PermissionWrapper {
-                val viewModel = viewModel<DlnaViewModel>()
+            val viewModel = viewModel<DlnaViewModel>()
+            val context = LocalContext.current
+
+            // Pass the start callback to the permission wrapper
+            PermissionWrapper(onPermissionsGranted = {
+                viewModel.startDlna(context)
+            }) {
+                // UI Content
                 val currentScreen by viewModel.currentScreen.collectAsState()
                 val selectedMedia by viewModel.selectedMediaItem.collectAsState()
 
@@ -73,6 +82,7 @@ fun DlnaApp() {
                         Screen.DEVICE_LIST -> DeviceListScreen(viewModel)
                         Screen.BROWSER -> BrowserScreen(viewModel)
                         Screen.REMOTE_CONTROL -> RemoteControlScreen(viewModel)
+                        Screen.SERVER_SETTINGS -> ServerSettingsScreen(viewModel)
                     }
 
                     if (selectedMedia != null) {
@@ -88,7 +98,334 @@ fun DlnaApp() {
     }
 }
 
-// --- UI: Remote Control Screen (NEW) ---
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ServerSettingsScreen(viewModel: DlnaViewModel) {
+    val allFolders by viewModel.allLocalFolders.collectAsState()
+    val selectedIds by viewModel.sharedFolderIds.collectAsState()
+
+    BackHandler { viewModel.closeSettings() }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Shared Folders") },
+                navigationIcon = {
+                    IconButton(onClick = { viewModel.closeSettings() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(modifier = Modifier.padding(padding).padding(16.dp)) {
+            Text(
+                "Select folders to make visible on TV:",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color.Gray,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+
+            LazyColumn {
+                items(allFolders) { folder ->
+                    val isChecked = selectedIds.contains(folder.id)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { viewModel.toggleFolderSharing(folder.id) }
+                            .padding(vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = isChecked,
+                            onCheckedChange = { viewModel.toggleFolderSharing(folder.id) }
+                        )
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Text(folder.title, style = MaterialTheme.typography.bodyLarge)
+                    }
+                    Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                }
+            }
+        }
+    }
+}
+
+// --- Updated Permission Wrapper ---
+@Composable
+fun PermissionWrapper(
+    onPermissionsGranted: () -> Unit,
+    content: @Composable () -> Unit
+) {
+    var permissionsGranted by remember { mutableStateOf(false) }
+
+    // Determine permissions based on Android Version
+    val requiredPermissions = remember {
+        if (Build.VERSION.SDK_INT >= 33) {
+            arrayOf(
+                Manifest.permission.NEARBY_WIFI_DEVICES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.READ_MEDIA_AUDIO,
+                Manifest.permission.READ_MEDIA_IMAGES
+            )
+        } else {
+            // Android 12 and below need Location for SSDP and Storage for files
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.READ_EXTERNAL_STORAGE
+            )
+        }
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        val allGranted = result.values.all { it }
+        if (allGranted) {
+            permissionsGranted = true
+            onPermissionsGranted()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        launcher.launch(requiredPermissions)
+    }
+
+    if (permissionsGranted) {
+        content()
+    } else {
+        Box(Modifier.fillMaxSize(), Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator()
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("Requesting Permissions...")
+                Text("(Storage needed to serve files)", fontSize = 12.sp, color = Color.Gray)
+            }
+        }
+    }
+}
+
+// --- ViewModel (Updated Logic) ---
+
+class DlnaViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val _devices = MutableStateFlow<List<Device>>(emptyList())
+    val devices: StateFlow<List<Device>> = _devices.asStateFlow()
+
+    private val _currentScreen = MutableStateFlow(Screen.DEVICE_LIST)
+    val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
+
+    val playbackState: StateFlow<PlaybackState> get() = DlnaManager.playback.playbackState
+
+    // Browser State
+    private val _browseResult = MutableStateFlow<BrowseResult?>(null)
+    val browseResult: StateFlow<BrowseResult?> = _browseResult.asStateFlow()
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+    private val _currentContainerTitle = MutableStateFlow("Root")
+    val currentContainerTitle: StateFlow<String> = _currentContainerTitle.asStateFlow()
+
+    // Selection
+    private val _selectedMediaItem = MutableStateFlow<MediaItem?>(null)
+    val selectedMediaItem: StateFlow<MediaItem?> = _selectedMediaItem.asStateFlow()
+
+    // --- NEW: Server Settings State ---
+    private val _allLocalFolders = MutableStateFlow<List<MediaContainer>>(emptyList())
+    val allLocalFolders: StateFlow<List<MediaContainer>> = _allLocalFolders.asStateFlow()
+
+    private val _sharedFolderIds = MutableStateFlow<Set<String>>(emptySet())
+    val sharedFolderIds: StateFlow<Set<String>> = _sharedFolderIds.asStateFlow()
+
+    private var contentProvider: MediaStoreContentProvider? = null
+
+    private var currentDeviceId: String? = null
+    private var activeContainerId: String = "0"
+    private val historyStack = mutableListOf<Pair<String, String>>()
+    private var isStarted = false
+
+    // Removed init block to prevent starting before permissions
+
+    fun startDlna(context: Context) {
+        if (isStarted) return
+        isStarted = true
+
+        val platform = AndroidDlnaPlatform(context)
+
+        // Load Saved Shared Folders
+        val prefs = context.getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
+        val savedFolders = prefs.getStringSet("shared_folders", emptySet()) ?: emptySet()
+        _sharedFolderIds.value = savedFolders
+
+        // Init Provider
+        val myContentProvider = MediaStoreContentProvider(context)
+        myContentProvider.setAllowedFolders(savedFolders)
+        this.contentProvider = myContentProvider
+
+        // Generate UDN
+        var serverUdn = prefs.getString("server_udn", null)
+        if (serverUdn == null) {
+            serverUdn = UUID.randomUUID().toString()
+            prefs.edit().putString("server_udn", serverUdn).apply()
+        }
+
+        val config = DlnaConfig(
+            enableMediaServer = true,
+            serverName = "Android (${Build.MODEL})",
+            serverUdn = serverUdn!!,
+            contentProvider = myContentProvider
+        )
+
+        DlnaManager.start(config, platform)
+
+        viewModelScope.launch {
+            DlnaManager.devices.devices.collect { _devices.value = it }
+        }
+    }
+
+    fun openSettings() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val folders = contentProvider?.getAllFolders() ?: emptyList()
+            withContext(Dispatchers.Main) {
+                _allLocalFolders.value = folders
+                _currentScreen.value = Screen.SERVER_SETTINGS
+            }
+        }
+    }
+
+    fun closeSettings() {
+        _currentScreen.value = Screen.DEVICE_LIST
+    }
+
+    fun toggleFolderSharing(folderId: String) {
+        val current = _sharedFolderIds.value.toMutableSet()
+        if (current.contains(folderId)) {
+            current.remove(folderId)
+        } else {
+            current.add(folderId)
+        }
+        _sharedFolderIds.value = current
+
+        // Update Provider
+        contentProvider?.setAllowedFolders(current)
+
+        // Persist
+        val context = getApplication<Application>().applicationContext
+        val prefs = context.getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
+        prefs.edit().putStringSet("shared_folders", current).apply()
+
+        // Notify library to refresh (Optional: DlnaManager.mediaServer.refreshContent())
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        DlnaManager.stop()
+    }
+
+    // --- Remote Control ---
+
+    fun connectToRenderer(device: Device) {
+        viewModelScope.launch {
+            try {
+                DlnaManager.playback.setRenderer(device.deviceId)
+                _currentScreen.value = Screen.REMOTE_CONTROL
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun closeRemote() {
+        _currentScreen.value = Screen.DEVICE_LIST
+    }
+
+    fun playResume() {
+        val state = playbackState.value.transportState
+        val item = playbackState.value.mediaItem
+
+        viewModelScope.launch {
+            try {
+                if (state == TransportState.PAUSED_PLAYBACK) {
+                    DlnaManager.playback.resume()
+                } else if (item != null) {
+                    DlnaManager.playback.play(item)
+                }
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+    }
+
+    fun pause() { viewModelScope.launch { try { DlnaManager.playback.pause() } catch(e: Exception) {} } }
+    fun stop() { viewModelScope.launch { try { DlnaManager.playback.stop() } catch(e: Exception) {} } }
+
+    fun seekTo(seconds: Long) {
+        viewModelScope.launch { try { DlnaManager.playback.seek(seconds.seconds) } catch (e: Exception) {} }
+    }
+
+    fun setVolume(vol: Int) {
+        viewModelScope.launch { try { DlnaManager.playback.setVolume(vol) } catch(e: Exception) {} }
+    }
+
+    // --- Browser ---
+
+    fun openBrowser(device: Device) {
+        currentDeviceId = device.deviceId
+        historyStack.clear()
+        _currentScreen.value = Screen.BROWSER
+        loadContainer("0", device.friendlyName)
+    }
+
+    fun browse(targetId: String, targetTitle: String) {
+        historyStack.add(activeContainerId to _currentContainerTitle.value)
+        loadContainer(targetId, targetTitle)
+    }
+
+    fun navigateUp() {
+        if (historyStack.isNotEmpty()) {
+            val (prevId, prevTitle) = historyStack.removeAt(historyStack.lastIndex)
+            loadContainer(prevId, prevTitle)
+        } else {
+            _currentScreen.value = Screen.DEVICE_LIST
+            _browseResult.value = null
+            currentDeviceId = null
+        }
+    }
+
+    private fun loadContainer(id: String, title: String) {
+        val deviceId = currentDeviceId ?: return
+        _isLoading.value = true
+        _currentContainerTitle.value = title
+        activeContainerId = id
+
+        viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    DlnaManager.browser.browse(deviceId, id, 0, 100)
+                }
+                _browseResult.value = result
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
+    // --- Selection ---
+    fun selectMedia(item: MediaItem) { _selectedMediaItem.value = item }
+    fun clearSelection() { _selectedMediaItem.value = null }
+
+    fun playOnRenderer(renderer: Device, item: MediaItem) {
+        viewModelScope.launch {
+            try {
+                DlnaManager.playback.setRenderer(renderer.deviceId)
+                DlnaManager.playback.play(item)
+                clearSelection()
+                _currentScreen.value = Screen.REMOTE_CONTROL
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+    }
+}
+
+// ... UI Composable for RemoteControlScreen, DeviceListScreen, DeviceCard, BrowserScreen, PlayOptionsSheet ...
+// (These remain exactly the same as your previous code, no changes needed there)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RemoteControlScreen(viewModel: DlnaViewModel) {
@@ -195,28 +532,65 @@ fun formatTime(seconds: Long): String {
     return String.format("%02d:%02d", m, s)
 }
 
-// --- UI: Device List (Updated with Remote Button) ---
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DeviceListScreen(viewModel: DlnaViewModel) {
     val devices by viewModel.devices.collectAsState()
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Discovered Devices", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 16.dp))
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("DLNA App") },
+                actions = {
+                    IconButton(onClick = { viewModel.openSettings() }) {
+                        Icon(
+                            Icons.Default.Settings,
+                            contentDescription = "Server Settings"
+                        )
+                    }
+                }
+            )
+        }
+    ) { paddingValues ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues)
+                .padding(16.dp)
+        ) {
+            Text(
+                text = "Discovered Devices",
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
 
-        if (devices.isEmpty()) {
-            Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
-                Spacer(modifier = Modifier.height(16.dp))
-                Text("Scanning...", modifier = Modifier.padding(top = 48.dp))
-            }
-        } else {
-            LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(devices) { device ->
-                    DeviceCard(
-                        device = device,
-                        onBrowse = { viewModel.openBrowser(device) },
-                        onRemote = { viewModel.connectToRenderer(device) }
-                    )
+            if (devices.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator()
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text("Scanning...")
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(devices) { device ->
+                        DeviceCard(
+                            device = device,
+                            onBrowse = { viewModel.openBrowser(device) },
+                            onRemote = { viewModel.connectToRenderer(device) }
+                        )
+                    }
                 }
             }
         }
@@ -241,6 +615,8 @@ fun DeviceCard(device: Device, onBrowse: () -> Unit, onRemote: () -> Unit) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(device.friendlyName, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     Text(if(isRenderer) "Renderer" else "Server", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                    Text(text = "LocationUrl: ${device.locationUrl}", fontSize = 12.sp)
+                    Text(text = "Services: ${device.services}", fontSize = 12.sp)
                 }
             }
 
@@ -266,160 +642,6 @@ fun DeviceCard(device: Device, onBrowse: () -> Unit, onRemote: () -> Unit) {
     }
 }
 
-// --- ViewModel (Updated with Remote Logic) ---
-
-class DlnaViewModel(application: Application) : AndroidViewModel(application) {
-
-    private val _devices = MutableStateFlow<List<Device>>(emptyList())
-    val devices: StateFlow<List<Device>> = _devices.asStateFlow()
-
-    private val _currentScreen = MutableStateFlow(Screen.DEVICE_LIST)
-    val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
-
-    val playbackState: StateFlow<PlaybackState> get() = DlnaManager.playback.playbackState
-
-    // Browser State
-    private val _browseResult = MutableStateFlow<BrowseResult?>(null)
-    val browseResult: StateFlow<BrowseResult?> = _browseResult.asStateFlow()
-    private val _isLoading = MutableStateFlow(false)
-    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
-    private val _currentContainerTitle = MutableStateFlow("Root")
-    val currentContainerTitle: StateFlow<String> = _currentContainerTitle.asStateFlow()
-
-    // Selection
-    private val _selectedMediaItem = MutableStateFlow<MediaItem?>(null)
-    val selectedMediaItem: StateFlow<MediaItem?> = _selectedMediaItem.asStateFlow()
-
-    private var currentDeviceId: String? = null
-    private var activeContainerId: String = "0"
-    private val historyStack = mutableListOf<Pair<String, String>>()
-
-    init {
-        startDlna()
-    }
-
-    private fun startDlna() {
-        val context = getApplication<Application>().applicationContext
-        val platform = AndroidDlnaPlatform(context)
-        val config = DlnaConfig(false, "Scanner", null, null)
-        DlnaManager.start(config, platform)
-
-        viewModelScope.launch {
-            DlnaManager.devices.devices.collect { _devices.value = it }
-        }
-    }
-
-    override fun onCleared() {
-        super.onCleared()
-        DlnaManager.stop()
-    }
-
-    // --- Remote Control ---
-
-    fun connectToRenderer(device: Device) {
-        viewModelScope.launch {
-            try {
-                DlnaManager.playback.setRenderer(device.deviceId)
-                _currentScreen.value = Screen.REMOTE_CONTROL
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-    }
-
-    fun closeRemote() {
-        _currentScreen.value = Screen.DEVICE_LIST
-    }
-
-    fun playResume() {
-        // If state is PAUSED, we call Resume. If stopped/unknown but we have an item, try Play.
-        val state = playbackState.value.transportState
-        val item = playbackState.value.mediaItem
-
-        viewModelScope.launch {
-            try {
-                if (state == TransportState.PAUSED_PLAYBACK) {
-                    DlnaManager.playback.resume()
-                } else if (item != null) {
-                    DlnaManager.playback.play(item)
-                }
-            } catch (e: Exception) { e.printStackTrace() }
-        }
-    }
-
-    fun pause() { viewModelScope.launch { try { DlnaManager.playback.pause() } catch(e: Exception) {} } }
-    fun stop() { viewModelScope.launch { try { DlnaManager.playback.stop() } catch(e: Exception) {} } }
-
-    fun seekTo(seconds: Long) {
-        viewModelScope.launch { try { DlnaManager.playback.seek(seconds.seconds) } catch (e: Exception) {} }
-    }
-
-    fun setVolume(vol: Int) {
-        viewModelScope.launch { try { DlnaManager.playback.setVolume(vol) } catch(e: Exception) {} }
-    }
-
-    // --- Browser ---
-
-    fun openBrowser(device: Device) {
-        currentDeviceId = device.deviceId
-        historyStack.clear()
-        _currentScreen.value = Screen.BROWSER
-        loadContainer("0", device.friendlyName)
-    }
-
-    fun browse(targetId: String, targetTitle: String) {
-        historyStack.add(activeContainerId to _currentContainerTitle.value)
-        loadContainer(targetId, targetTitle)
-    }
-
-    fun navigateUp() {
-        if (historyStack.isNotEmpty()) {
-            val (prevId, prevTitle) = historyStack.removeAt(historyStack.lastIndex)
-            loadContainer(prevId, prevTitle)
-        } else {
-            _currentScreen.value = Screen.DEVICE_LIST
-            _browseResult.value = null
-            currentDeviceId = null
-        }
-    }
-
-    private fun loadContainer(id: String, title: String) {
-        val deviceId = currentDeviceId ?: return
-        _isLoading.value = true
-        _currentContainerTitle.value = title
-        activeContainerId = id
-
-        viewModelScope.launch {
-            try {
-                val result = withContext(Dispatchers.IO) {
-                    DlnaManager.browser.browse(deviceId, id, 0, 100)
-                }
-                _browseResult.value = result
-            } catch (e: Exception) {
-                e.printStackTrace()
-            } finally {
-                _isLoading.value = false
-            }
-        }
-    }
-
-    // --- Selection ---
-    fun selectMedia(item: MediaItem) { _selectedMediaItem.value = item }
-    fun clearSelection() { _selectedMediaItem.value = null }
-
-    fun playOnRenderer(renderer: Device, item: MediaItem) {
-        viewModelScope.launch {
-            try {
-                DlnaManager.playback.setRenderer(renderer.deviceId)
-                DlnaManager.playback.play(item)
-                clearSelection()
-                _currentScreen.value = Screen.REMOTE_CONTROL
-            } catch (e: Exception) { e.printStackTrace() }
-        }
-    }
-}
-
-// ... Keep existing BrowserScreen and PlayOptionsSheet (Same as before) ...
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BrowserScreen(viewModel: DlnaViewModel) {
@@ -465,6 +687,11 @@ fun BrowserScreen(viewModel: DlnaViewModel) {
                             Column {
                                 Text(text = info?.mimeType ?: "Unknown Format", fontSize = 12.sp)
                                 Text(text = "Dur: ${info?.duration} | Size: ${info?.size}", fontSize = 12.sp)
+                                Text(text = "Resources: ${file.resources}", fontSize = 12.sp)
+                                Text(text = "Thumbnail: ${file.thumbnail}", fontSize = 12.sp)
+                                Text(text = "Uri: ${info?.uri}", fontSize = 12.sp)
+                                Text(text = "Resolution: ${info?.resolution}", fontSize = 12.sp)
+                                Text(text = "ProtocolInfo: ${info?.protocolInfo}", fontSize = 12.sp)
                             }
                         },
                         leadingContent = { Icon(Icons.Default.MusicNote, contentDescription = null) },
@@ -530,16 +757,8 @@ fun PlayOptionsSheet(mediaItem: MediaItem, viewModel: DlnaViewModel, onDismiss: 
     }
 }
 
-// --- Permissions ---
-@Composable
-fun PermissionWrapper(content: @Composable () -> Unit) {
-    var permissionsGranted by remember { mutableStateOf(false) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-        if (it.isEmpty()) permissionsGranted = true else permissionsGranted = it.values.all { granted -> granted }
-    }
-    LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= 33) launcher.launch(arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES))
-        else permissionsGranted = true
-    }
-    if (permissionsGranted) content() else Box(Modifier.fillMaxSize(), Alignment.Center) { Text("Waiting for permissions...") }
-}
+
+
+// ... Keep RemoteControlScreen, DeviceListScreen, DeviceCard, BrowserScreen, PlayOptionsSheet ...
+// Just ensure you include the 'RemoteControlScreen' and 'DeviceListScreen' UI code blocks I didn't repeat here to save space,
+// as they were correct in your previous message.
