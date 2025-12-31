@@ -31,6 +31,57 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
         MediaStore.Files.getContentUri("external")
     }
 
+    override suspend fun getMetadata(mediaId: String): MediaObject? {
+        // 1. Root
+        if (mediaId == "0") {
+            return MediaContainer("0", "-1", "Root", childCount = null, searchable = true)
+        }
+
+        // 2. Folder (Bucket)
+        if (allowedFolderIds.contains(mediaId)) {
+            // We need to fetch the name of the bucket
+            val projection = arrayOf(MediaStore.Files.FileColumns.BUCKET_DISPLAY_NAME)
+            val selection = "${MediaStore.Files.FileColumns.BUCKET_ID} = ?"
+            val args = arrayOf(mediaId)
+
+            try {
+                context.contentResolver.query(collectionUri, projection, selection, args, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        val name = c.getString(0) ?: "Folder"
+                        return MediaContainer(mediaId, "0", name, searchable = false)
+                    }
+                }
+            } catch (e: Exception) { }
+        }
+
+        // 3. File
+        // If not a known folder, try to find it as a file
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns._ID,
+            MediaStore.Files.FileColumns.DISPLAY_NAME,
+            MediaStore.Files.FileColumns.MIME_TYPE,
+            MediaStore.Files.FileColumns.SIZE,
+            MediaStore.Files.FileColumns.DURATION,
+            MediaStore.Files.FileColumns.MEDIA_TYPE,
+            MediaStore.Files.FileColumns.BUCKET_ID
+        )
+        val selection = "${MediaStore.Files.FileColumns._ID} = ?"
+
+        try {
+            context.contentResolver.query(collectionUri, projection, selection, arrayOf(mediaId), null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val bucketId = c.getString(c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.BUCKET_ID))
+                    // Only return metadata if the parent folder is allowed
+                    if (allowedFolderIds.contains(bucketId)) {
+                        return mapCursorToMediaItem(c, bucketId)
+                    }
+                }
+            }
+        } catch (e: Exception) { }
+
+        return null
+    }
+
     override suspend fun list(containerId: String): List<MediaObject> {
         return if (containerId == "0") {
             getFoldersInternal(filterAllowed = true)
@@ -104,7 +155,6 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
         val id = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID))
         val title = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)) ?: "Unknown"
         val mimeType = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MIME_TYPE)) ?: "application/octet-stream"
-        // Note: We still read DB size for the listing, but openMedia will check real size
         val size = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE))
         val durationIndex = cursor.getColumnIndex(MediaStore.Files.FileColumns.DURATION)
         val duration = if (durationIndex != -1 && !cursor.isNull(durationIndex)) cursor.getLong(durationIndex).milliseconds else null

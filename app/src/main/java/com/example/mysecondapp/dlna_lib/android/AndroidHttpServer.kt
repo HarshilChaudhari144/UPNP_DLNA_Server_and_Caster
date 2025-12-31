@@ -1,40 +1,38 @@
 package com.example.mysecondapp.dlna_lib.android
 
-import com.example.mysecondapp.dlna_lib.platform.HttpHandler
-import com.example.mysecondapp.dlna_lib.platform.HttpMethod
-import com.example.mysecondapp.dlna_lib.platform.HttpRequest
-import com.example.mysecondapp.dlna_lib.platform.HttpResponse
-import com.example.mysecondapp.dlna_lib.platform.HttpServer
+import android.util.Log
+import com.example.mysecondapp.dlna_lib.platform.*
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
 import java.io.BufferedInputStream
-import java.io.InputStream
 
 class AndroidHttpServer : HttpServer {
 
+    private val TAG = "AndroidHttpServer"
     private var nanoServer: WrappedNano? = null
 
     override fun start(port: Int, handler: HttpHandler) {
         if (nanoServer?.isAlive == true) return
+        Log.d(TAG, "Starting HTTP Server on port $port")
         nanoServer = WrappedNano(port, handler)
         nanoServer?.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
     }
 
     override fun stop() {
+        Log.d(TAG, "Stopping HTTP Server")
         nanoServer?.stop()
         nanoServer = null
     }
 
-    override fun getPort(): Int {
-        return nanoServer?.listeningPort ?: 0
-    }
+    override fun getPort(): Int = nanoServer?.listeningPort ?: 0
 
     private inner class WrappedNano(port: Int, private val handler: HttpHandler) : NanoHTTPD(port) {
 
         override fun serve(session: IHTTPSession): Response {
+            Log.d(TAG, "HTTP REQ: ${session.method} ${session.uri}") // <--- LOG THIS
+
             val method = mapMethod(session.method)
-            // Optimization: Only read body for POST
-            val body = if (method == HttpMethod.POST) readBody(session) else null
+            val body = if(method == HttpMethod.POST) readBody(session) else null
 
             val request = HttpRequest(
                 method = method,
@@ -48,42 +46,29 @@ class AndroidHttpServer : HttpServer {
 
             val status = Response.Status.lookup(response.statusCode) ?: Response.Status.OK
             val mime = response.mimeType ?: "application/octet-stream"
+            val totalLength = response.contentLength ?: -1L
 
-            // Safe length check
-            val totalLength = response.contentLength
-                ?: response.headers["Content-Length"]?.toLongOrNull()
-                ?: -1L
-
-            // 1. Create Response
             val nanoResponse = if (response.inputStream != null) {
-                // FIX: Use BufferedInputStream (64KB) matching Reference File logic.
-                // This prevents ConnectionReset by feeding the socket efficiently.
                 val bufferedStream = BufferedInputStream(response.inputStream, 64 * 1024)
                 newFixedLengthResponse(status, mime, bufferedStream, totalLength)
             } else {
                 newFixedLengthResponse(status, mime, response.body ?: "")
             }
 
-            // 2. Add Headers
             response.headers.forEach { (k, v) ->
-                // NanoHTTPD manages Content-Length internally if totalLength is passed above.
-                // We add all other headers (DLNA flags, Ranges, etc).
-                if (!k.equals("Content-Length", true)) {
-                    nanoResponse.addHeader(k, v)
-                }
+                if (!k.equals("Content-Length", true)) nanoResponse.addHeader(k, v)
             }
-
-            // FIX: Removed manual HEAD handling.
-            // The reference code does NOT manually set data=null.
-            // NanoHTTPD's internal 'send' method checks the method and skips writing the body automatically.
+//            Never Uncomment the below if. Handling this will stop us from serving media properly.
+//            if (method == HttpMethod.HEAD) {
+//                nanoResponse.data = null
+//                nanoResponse.requestMethod = Method.HEAD
+//            }
 
             return nanoResponse
         }
 
         private fun mapMethod(nanoMethod: Method?): HttpMethod {
-            return try {
-                HttpMethod.valueOf(nanoMethod?.name ?: "GET")
-            } catch (e: Exception) { HttpMethod.GET }
+            return try { HttpMethod.valueOf(nanoMethod?.name ?: "GET") } catch (e: Exception) { HttpMethod.GET }
         }
 
         private fun readBody(session: IHTTPSession): String? {

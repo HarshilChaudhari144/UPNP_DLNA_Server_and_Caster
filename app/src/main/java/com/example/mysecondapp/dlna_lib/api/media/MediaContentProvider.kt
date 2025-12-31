@@ -12,6 +12,9 @@ interface MediaContentProvider {
      */
     suspend fun list(containerId: ContainerId): List<MediaObject>
 
+    // NEW: Fetch details for a single object (File or Folder)
+    suspend fun getMetadata(mediaId: MediaId): MediaObject?
+
     /**
      * Provides a way to read the actual bytes of a media file.
      */

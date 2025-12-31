@@ -21,7 +21,6 @@ internal class SsdpController(
 ) {
     private val tag = "SsdpController"
 
-    // Server Info (Set by MediaServerController)
     data class ServerInfo(val usn: String, val location: String)
     private var serverInfo: ServerInfo? = null
 
@@ -44,7 +43,6 @@ internal class SsdpController(
             handlePacket(data, address, port)
         }
 
-        // Send Discovery
         dlnaScope.launch(Dispatchers.IO) {
             repeat(3) {
                 searchTargets.forEach { target ->
@@ -66,13 +64,13 @@ internal class SsdpController(
             val firstLine = cleanText.substringBefore("\r\n").uppercase()
             val headers = parseHeaders(cleanText)
 
-            // 1. Handle SEARCH (We are Server)
             if (firstLine.startsWith("M-SEARCH")) {
+                DlnaLogger.d(tag, "Received M-SEARCH from $address:$port | ST=${headers["ST"]}")
                 handleSearch(headers, address, port)
                 return
             }
 
-            // 2. Handle NOTIFY/RESPONSE (We are Client)
+            // ... (Rest of client logic is silent to reduce noise) ...
             val isNotify = firstLine.startsWith("NOTIFY")
             val isResponse = firstLine.startsWith("HTTP/1.1 200")
             if (!isNotify && !isResponse) return
@@ -96,25 +94,32 @@ internal class SsdpController(
     }
 
     private fun handleSearch(headers: Map<String, String>, address: String, port: Int) {
-        val server = serverInfo ?: return
+        val server = serverInfo
+        if (server == null) {
+            DlnaLogger.w(tag, "Ignoring Search: ServerInfo not set yet")
+            return
+        }
+
         val st = headers["ST"] ?: return
 
-        // Check if they are looking for us
-        if (st == "ssdp:all" ||
-            st == "upnp:rootdevice" ||
-            st == "urn:schemas-upnp-org:device:MediaServer:1" ||
-            st == server.usn) {
+        val myTargets = listOf(
+            "upnp:rootdevice",
+            "urn:schemas-upnp-org:device:MediaServer:1",
+            server.usn
+        )
 
-            // FIX: If searching for "all", reply as "rootdevice".
-            // This is the standard "Hello" for a new device.
-            val replySt = if (st == "ssdp:all") "upnp:rootdevice" else st
-
-            val response = buildSearchResponse(replySt, server)
+        if (st == "ssdp:all") {
+            DlnaLogger.d(tag, "Broadcasting ALL identities to $address")
+            myTargets.forEach { target ->
+                val response = buildSearchResponse(target, server)
+                transport.sendTo(response, address, port)
+            }
+        } else if (myTargets.contains(st)) {
+            DlnaLogger.d(tag, "Matched Target '$st'. Replying to $address")
+            val response = buildSearchResponse(st, server)
             transport.sendTo(response, address, port)
-
-            // OPTIONAL: If they asked for "all", we can technically send multiple responses
-            // (one for root, one for UUID, one for MediaServer).
-            // But usually 'rootdevice' is enough to get the TV to download description.xml.
+        } else {
+            DlnaLogger.d(tag, "Ignoring ST '$st' (Not me)")
         }
     }
 
@@ -123,14 +128,7 @@ internal class SsdpController(
             timeZone = TimeZone.getTimeZone("GMT")
         }.format(Date())
 
-        // FIX: Construct USN based on the Search Target (ST)
-        // If searching for UUID, USN is just UUID.
-        // Otherwise, USN is UUID::ST
-        val usn = if (st == server.usn) {
-            server.usn // uuid:1234...
-        } else {
-            "${server.usn}::$st" // uuid:1234...::upnp:rootdevice
-        }
+        val usn = if (st == server.usn) server.usn else "${server.usn}::$st"
 
         return "HTTP/1.1 200 OK\r\n" +
                 "CACHE-CONTROL: max-age=1800\r\n" +
@@ -140,23 +138,18 @@ internal class SsdpController(
                 "SERVER: Android/1.0 DLNA-Lib/1.0 UPnP/1.0\r\n" +
                 "ST: $st\r\n" +
                 "USN: $usn\r\n" +
+                "BOOTID.UPNP.ORG: 1\r\n" +
                 "\r\n"
     }
 
     private fun buildSearchPacket(st: String): String {
-        return "M-SEARCH * HTTP/1.1\r\n" +
-                "HOST: 239.255.255.250:1900\r\n" +
-                "MAN: \"ssdp:discover\"\r\n" +
-                "MX: 3\r\n" +
-                "ST: $st\r\n" +
-                "USER-AGENT: Android/1.0 DLNA-Lib/1.0 UPnP/1.1\r\n" +
-                "\r\n"
+        return "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: $st\r\nUSER-AGENT: Android/1.0 DLNA-Lib/1.0 UPnP/1.1\r\n\r\n"
     }
 
     private fun parseHeaders(text: String): Map<String, String> {
         val map = mutableMapOf<String, String>()
         val reader = BufferedReader(StringReader(text))
-        reader.readLine() // Skip first line
+        reader.readLine()
         var line = reader.readLine()
         while (line != null) {
             if (line.isNotBlank()) {

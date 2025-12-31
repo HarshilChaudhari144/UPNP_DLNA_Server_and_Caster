@@ -95,20 +95,195 @@ internal class MediaServerController(
                 // Media Streaming & Thumbnails (Delegate)
                 path.startsWith("/content/") || path.startsWith("/thumb/") -> mediaHandler.handle(request)
 
+                // SCPD (Service Description)
+                path == "/scpd/ContentDirectory.xml" -> serveContentDirectoryScpd()
+                path == "/scpd/ConnectionManager.xml" -> serveConnectionManagerScpd()
+
+
                 else -> HttpResponse(404)
             }
         }
     }
 
+    private fun serveContentDirectoryScpd(): HttpResponse {
+        val xml = """
+        <?xml version="1.0"?>
+        <scpd xmlns="urn:schemas-upnp-org:service-1-0">
+            <specVersion>
+                <major>1</major>
+                <minor>0</minor>
+            </specVersion>
+
+            <actionList>
+                <action>
+                    <name>Browse</name>
+                    <argumentList>
+                        <argument>
+                            <name>ObjectID</name>
+                            <direction>in</direction>
+                            <relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable>
+                        </argument>
+                        <argument>
+                            <name>BrowseFlag</name>
+                            <direction>in</direction>
+                            <relatedStateVariable>A_ARG_TYPE_BrowseFlag</relatedStateVariable>
+                        </argument>
+                        <argument>
+                            <name>Filter</name>
+                            <direction>in</direction>
+                            <relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable>
+                        </argument>
+                        <argument>
+                            <name>StartingIndex</name>
+                            <direction>in</direction>
+                            <relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable>
+                        </argument>
+                        <argument>
+                            <name>RequestedCount</name>
+                            <direction>in</direction>
+                            <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
+                        </argument>
+                        <argument>
+                            <name>SortCriteria</name>
+                            <direction>in</direction>
+                            <relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable>
+                        </argument>
+
+                        <argument>
+                            <name>Result</name>
+                            <direction>out</direction>
+                            <relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable>
+                        </argument>
+                        <argument>
+                            <name>NumberReturned</name>
+                            <direction>out</direction>
+                            <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
+                        </argument>
+                        <argument>
+                            <name>TotalMatches</name>
+                            <direction>out</direction>
+                            <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
+                        </argument>
+                        <argument>
+                            <name>UpdateID</name>
+                            <direction>out</direction>
+                            <relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable>
+                        </argument>
+                    </argumentList>
+                </action>
+            </actionList>
+
+            <serviceStateTable>
+                <stateVariable sendEvents="no">
+                    <name>A_ARG_TYPE_ObjectID</name>
+                    <dataType>string</dataType>
+                </stateVariable>
+                <stateVariable sendEvents="no">
+                    <name>A_ARG_TYPE_BrowseFlag</name>
+                    <dataType>string</dataType>
+                </stateVariable>
+                <stateVariable sendEvents="no">
+                    <name>A_ARG_TYPE_Filter</name>
+                    <dataType>string</dataType>
+                </stateVariable>
+                <stateVariable sendEvents="no">
+                    <name>A_ARG_TYPE_Index</name>
+                    <dataType>ui4</dataType>
+                </stateVariable>
+                <stateVariable sendEvents="no">
+                    <name>A_ARG_TYPE_Count</name>
+                    <dataType>ui4</dataType>
+                </stateVariable>
+                <stateVariable sendEvents="no">
+                    <name>A_ARG_TYPE_SortCriteria</name>
+                    <dataType>string</dataType>
+                </stateVariable>
+                <stateVariable sendEvents="no">
+                    <name>A_ARG_TYPE_Result</name>
+                    <dataType>string</dataType>
+                </stateVariable>
+                <stateVariable sendEvents="no">
+                    <name>A_ARG_TYPE_UpdateID</name>
+                    <dataType>ui4</dataType>
+                </stateVariable>
+            </serviceStateTable>
+        </scpd>
+    """.trimIndent()
+
+        return HttpResponse(
+            statusCode = 200,
+            mimeType = "text/xml",
+            body = xml
+        )
+    }
+
+    private fun serveConnectionManagerScpd(): HttpResponse {
+        val xml = """
+        <?xml version="1.0"?>
+        <scpd xmlns="urn:schemas-upnp-org:service-1-0">
+            <specVersion>
+                <major>1</major>
+                <minor>0</minor>
+            </specVersion>
+
+            <actionList>
+                <action>
+                    <name>GetProtocolInfo</name>
+                    <argumentList>
+                        <argument>
+                            <name>Source</name>
+                            <direction>out</direction>
+                            <relatedStateVariable>SourceProtocolInfo</relatedStateVariable>
+                        </argument>
+                        <argument>
+                            <name>Sink</name>
+                            <direction>out</direction>
+                            <relatedStateVariable>SinkProtocolInfo</relatedStateVariable>
+                        </argument>
+                    </argumentList>
+                </action>
+            </actionList>
+
+            <serviceStateTable>
+                <stateVariable sendEvents="no">
+                    <name>SourceProtocolInfo</name>
+                    <dataType>string</dataType>
+                </stateVariable>
+                <stateVariable sendEvents="no">
+                    <name>SinkProtocolInfo</name>
+                    <dataType>string</dataType>
+                </stateVariable>
+            </serviceStateTable>
+        </scpd>
+    """.trimIndent()
+
+        return HttpResponse(
+            statusCode = 200,
+            mimeType = "text/xml",
+            body = xml
+        )
+    }
+
+
     // --- 2. DEVICE DESCRIPTION ---
 
     private fun serveDescription(): HttpResponse {
         val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
-        // Note: Using the actual UUID for the device ensures consistency
+
+        // FIX: Only show icon block if we have a provider
+        val iconXml = if (config.thumbnailProvider != null) """
+            <iconList>
+                <icon>
+                    <mimetype>image/png</mimetype>
+                    <width>48</width><height>48</height><depth>24</depth>
+                    <url>/thumb/app_icon</url>
+                </icon>
+            </iconList>
+        """.trimIndent() else ""
 
         val xml = """
             <?xml version="1.0"?>
-            <root xmlns="urn:schemas-upnp-org:device-1-0">
+            <root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">
                 <specVersion><major>1</major><minor>0</minor></specVersion>
                 <device>
                     <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
@@ -116,6 +291,8 @@ internal class MediaServerController(
                     <manufacturer>DLNA Lib</manufacturer>
                     <modelName>Kotlin Media Server</modelName>
                     <UDN>$serverUuid</UDN>
+                    <dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>
+                    $iconXml
                     <serviceList>
                         <service>
                             <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
@@ -136,11 +313,7 @@ internal class MediaServerController(
             </root>
         """.trimIndent()
 
-        return HttpResponse(
-            statusCode = 200,
-            mimeType = "text/xml",
-            body = xml
-        )
+        return HttpResponse(200, "text/xml", body = xml)
     }
 
     // --- 3. SOAP HANDLERS ---
@@ -163,21 +336,34 @@ internal class MediaServerController(
     private suspend fun handleBrowse(request: HttpRequest): HttpResponse {
         val body = request.body ?: return HttpResponse(400)
 
-        // Parse Arguments
         val args = parseSoapBody(body)
         val objectId = args["ObjectID"] ?: "0"
+        val browseFlag = args["BrowseFlag"] ?: "BrowseDirectChildren" // Extract Flag
         val startIndex = args["StartingIndex"]?.toIntOrNull() ?: 0
         val count = args["RequestedCount"]?.toIntOrNull() ?: 20
 
         try {
-            // Fetch from App Provider
-            val list = config.contentProvider?.list(objectId) ?: emptyList()
+            val list: List<MediaObject>
 
-            // Pagination logic
+            // FIX: Handle Metadata vs Children request
+            if (browseFlag == "BrowseMetadata") {
+                // TV wants info about THIS folder, not what's inside it
+                val metadata = config.contentProvider?.getMetadata(objectId)
+                list = if (metadata != null) listOf(metadata) else emptyList()
+            } else {
+                // TV wants content inside the folder
+                list = config.contentProvider?.list(objectId) ?: emptyList()
+            }
+
             val totalMatches = list.size
-            val slicedList = if (count == 0) list else list.drop(startIndex).take(count) // 0 means all
 
-            // Convert to DIDL
+            // Slice only for DirectChildren; Metadata is always 1 item (no pagination needed)
+            val slicedList = if (browseFlag == "BrowseMetadata" || count == 0) {
+                list
+            } else {
+                list.drop(startIndex).take(count)
+            }
+
             val didlXml = generateDidl(slicedList)
             val numberReturned = slicedList.size
 
@@ -224,9 +410,13 @@ internal class MediaServerController(
             val title = escapeXml(obj.title)
 
             if (obj is MediaContainer) {
-                sb.append("""<container id="$id" parentID="$parent" restricted="1" searchable="0">""")
+                // FIX: Add childCount if available (some TVs hide folders without this)
+                val childCountAttr = if (obj.childCount != null) " childCount=\"${obj.childCount}\"" else ""
+
+                sb.append("""<container id="$id" parentID="$parent" restricted="1" searchable="0"$childCountAttr>""")
                 sb.append("<dc:title>$title</dc:title>")
-                sb.append("<upnp:class>object.container</upnp:class>")
+                // FIX: Use standard storageFolder class
+                sb.append("<upnp:class>object.container.storageFolder</upnp:class>")
                 sb.append("</container>")
             } else if (obj is MediaItem) {
                 val upnpClass = obj.upnpClass
@@ -256,7 +446,7 @@ internal class MediaServerController(
                 sb.append("<upnp:class>$upnpClass</upnp:class>")
 
                 // Flags: OP=01 (Byte Seek) for better TV compatibility
-                val dlnaFlags = "DLNA.ORG_PN=AVC_MP4_BL_CIF15_AAC_520;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+                val dlnaFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
                 sb.append("""<res protocolInfo="http-get:*:$mime:$dlnaFlags">$url</res>""")
 
