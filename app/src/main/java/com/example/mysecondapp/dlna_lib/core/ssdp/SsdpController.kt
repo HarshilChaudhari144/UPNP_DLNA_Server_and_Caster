@@ -9,6 +9,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.BufferedReader
 import java.io.StringReader
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
+import java.util.Date
 
 internal class SsdpController(
     private val transport: SsdpTransport,
@@ -17,7 +21,14 @@ internal class SsdpController(
 ) {
     private val tag = "SsdpController"
 
-    // Target list covers most devices
+    // Server Info (Set by MediaServerController)
+    data class ServerInfo(val usn: String, val location: String)
+    private var serverInfo: ServerInfo? = null
+
+    fun setServerInfo(usn: String, location: String) {
+        this.serverInfo = ServerInfo(usn, location)
+    }
+
     private val searchTargets = listOf(
         "upnp:rootdevice",
         "urn:schemas-upnp-org:device:MediaRenderer:1",
@@ -29,22 +40,15 @@ internal class SsdpController(
         DlnaLogger.d(tag, "Starting SSDP Controller")
         cache.start()
 
-        // 1. Listen
-        transport.listen { data, address ->
-            handlePacket(data, address)
+        transport.listen { data, address, port ->
+            handlePacket(data, address, port)
         }
 
-        // 2. Send Discovery (Burst Mode)
+        // Send Discovery
         dlnaScope.launch(Dispatchers.IO) {
             repeat(3) {
                 searchTargets.forEach { target ->
-                    try {
-                        val packet = buildSearchPacket(target)
-                        transport.send(packet)
-                        delay(100)
-                    } catch (e: Exception) {
-                        DlnaLogger.w(tag, "Failed to send M-SEARCH: ${e.message}")
-                    }
+                    try { transport.send(buildSearchPacket(target)); delay(100) } catch (e: Exception) { }
                 }
                 delay(1000)
             }
@@ -52,78 +56,112 @@ internal class SsdpController(
     }
 
     fun stop() {
-        DlnaLogger.d(tag, "Stopping SSDP Controller")
         cache.stop()
         transport.stop()
     }
 
-    /**
-     * Constructs a strictly formatted M-SEARCH packet.
-     * CRITICAL: Must use \r\n and end with a double \r\n.
-     */
-    private fun buildSearchPacket(st: String): String {
-        val sb = StringBuilder()
-        sb.append("M-SEARCH * HTTP/1.1\r\n")
-        sb.append("HOST: 239.255.255.250:1900\r\n")
-        sb.append("MAN: \"ssdp:discover\"\r\n")
-        sb.append("MX: 3\r\n")
-        sb.append("ST: $st\r\n")
-        // Samsung & LG often require User-Agent to respond
-        sb.append("USER-AGENT: Android/1.0 DLNA-Lib/1.0 UPnP/1.1\r\n")
-        sb.append("\r\n") // Blank line to end headers
-        return sb.toString()
-    }
-
-    private fun handlePacket(text: String, address: String = "") {
+    private fun handlePacket(text: String, address: String, port: Int) {
         try {
-            // Trim leading whitespace (some devices send garbage at start)
             val cleanText = text.trimStart()
-
             val firstLine = cleanText.substringBefore("\r\n").uppercase()
+            val headers = parseHeaders(cleanText)
+
+            // 1. Handle SEARCH (We are Server)
+            if (firstLine.startsWith("M-SEARCH")) {
+                handleSearch(headers, address, port)
+                return
+            }
+
+            // 2. Handle NOTIFY/RESPONSE (We are Client)
             val isNotify = firstLine.startsWith("NOTIFY")
             val isResponse = firstLine.startsWith("HTTP/1.1 200")
-
             if (!isNotify && !isResponse) return
-
-            val headers = parseHeaders(cleanText)
 
             val usn = headers["USN"]
             val udn = extractUdn(usn) ?: return
-
             val location = headers["LOCATION"]
             val nts = headers["NTS"]
 
             if (nts == "ssdp:byebye") {
                 cache.recordByeBye(udn)
                 stateMachine.onSsdpByeBye(udn)
-                return
-            }
-
-            if (location != null) {
+            } else if (location != null) {
                 val maxAge = parseCacheControl(headers["CACHE-CONTROL"])
                 cache.recordAlive(udn, maxAge)
                 stateMachine.onSsdpAlive(location, maxAge)
             }
-
         } catch (e: Exception) {
             DlnaLogger.w(tag, "Error parsing packet: ${e.message}")
         }
     }
 
+    private fun handleSearch(headers: Map<String, String>, address: String, port: Int) {
+        val server = serverInfo ?: return
+        val st = headers["ST"] ?: return
+
+        // Check if they are looking for us
+        if (st == "ssdp:all" ||
+            st == "upnp:rootdevice" ||
+            st == "urn:schemas-upnp-org:device:MediaServer:1" ||
+            st == server.usn) {
+
+            // FIX: If searching for "all", reply as "rootdevice".
+            // This is the standard "Hello" for a new device.
+            val replySt = if (st == "ssdp:all") "upnp:rootdevice" else st
+
+            val response = buildSearchResponse(replySt, server)
+            transport.sendTo(response, address, port)
+
+            // OPTIONAL: If they asked for "all", we can technically send multiple responses
+            // (one for root, one for UUID, one for MediaServer).
+            // But usually 'rootdevice' is enough to get the TV to download description.xml.
+        }
+    }
+
+    private fun buildSearchResponse(st: String, server: ServerInfo): String {
+        val date = SimpleDateFormat("E, dd MMM yyyy HH:mm:ss z", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("GMT")
+        }.format(Date())
+
+        // FIX: Construct USN based on the Search Target (ST)
+        // If searching for UUID, USN is just UUID.
+        // Otherwise, USN is UUID::ST
+        val usn = if (st == server.usn) {
+            server.usn // uuid:1234...
+        } else {
+            "${server.usn}::$st" // uuid:1234...::upnp:rootdevice
+        }
+
+        return "HTTP/1.1 200 OK\r\n" +
+                "CACHE-CONTROL: max-age=1800\r\n" +
+                "DATE: $date\r\n" +
+                "EXT:\r\n" +
+                "LOCATION: ${server.location}\r\n" +
+                "SERVER: Android/1.0 DLNA-Lib/1.0 UPnP/1.0\r\n" +
+                "ST: $st\r\n" +
+                "USN: $usn\r\n" +
+                "\r\n"
+    }
+
+    private fun buildSearchPacket(st: String): String {
+        return "M-SEARCH * HTTP/1.1\r\n" +
+                "HOST: 239.255.255.250:1900\r\n" +
+                "MAN: \"ssdp:discover\"\r\n" +
+                "MX: 3\r\n" +
+                "ST: $st\r\n" +
+                "USER-AGENT: Android/1.0 DLNA-Lib/1.0 UPnP/1.1\r\n" +
+                "\r\n"
+    }
+
     private fun parseHeaders(text: String): Map<String, String> {
         val map = mutableMapOf<String, String>()
         val reader = BufferedReader(StringReader(text))
-
-        // Skip first line
-        reader.readLine()
-
+        reader.readLine() // Skip first line
         var line = reader.readLine()
         while (line != null) {
             if (line.isNotBlank()) {
                 val parts = line.split(":", limit = 2)
-                if (parts.size == 2) {
-                    map[parts[0].trim().uppercase()] = parts[1].trim()
-                }
+                if (parts.size == 2) map[parts[0].trim().uppercase()] = parts[1].trim()
             }
             line = reader.readLine()
         }
@@ -132,21 +170,12 @@ internal class SsdpController(
 
     private fun extractUdn(usn: String?): String? {
         if (usn == null) return null
-        return if (usn.startsWith("uuid:")) {
-            val parts = usn.split("::")
-            parts[0]
-        } else {
-            usn
-        }
+        return if (usn.startsWith("uuid:")) usn.split("::")[0] else usn
     }
 
     private fun parseCacheControl(cc: String?): Int {
         if (cc == null) return 1800
-        return try {
-            val part = cc.split(",").find { it.trim().lowercase().startsWith("max-age") }
-            part?.substringAfter("=")?.trim()?.toInt() ?: 1800
-        } catch (e: Exception) {
-            1800
-        }
+        val part = cc.split(",").find { it.trim().lowercase().startsWith("max-age") }
+        return part?.substringAfter("=")?.trim()?.toIntOrNull() ?: 1800
     }
 }

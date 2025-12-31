@@ -42,6 +42,7 @@ internal class DlnaEngine(
     private val deviceStateMachine = DeviceStateMachine(deviceRepository, descriptorParser)
     private val ssdpCache = SsdpCache(deviceStateMachine)
 
+    // SsdpController is responsible for both client M-SEARCH and server M-SEARCH response
     private val ssdpController = SsdpController(platform.ssdp, deviceStateMachine, ssdpCache)
 
     // --- 3. Functional Controllers ---
@@ -56,14 +57,15 @@ internal class DlnaEngine(
     )
 
     // Local Media Server (Now Enabled)
-    // We pass 'platform.ssdp' so the server can send its own "Alive" notifications
+    // FIX: Pass ssdpController so MediaServerController can register its info with it.
     val mediaServerController = if (config.enableMediaServer && config.contentProvider != null) {
         MediaServerController(
             config = config,
             httpServer = platform.httpServer,
             mimeResolver = platform.mimeResolver,
             networkInfo = platform.networkInfo,
-            ssdpTransport = platform.ssdp
+            ssdpTransport = platform.ssdp,
+            ssdpController = ssdpController // <--- ADDED THIS
         )
     } else null
 

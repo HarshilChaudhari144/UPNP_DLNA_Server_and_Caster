@@ -1,20 +1,14 @@
 package com.example.mysecondapp.dlna_lib.platform
 
 interface SsdpTransport {
-    /**
-     * Sends an SSDP message (e.g., M-SEARCH or NOTIFY) to the multicast group.
-     */
+    // Broadcast/Multicast send
     fun send(data: String)
 
-    /**
-     * Starts listening for incoming SSDP packets.
-     * @param onReceive Callback triggered whenever a packet arrives.
-     * Provides the raw packet data and the sender's address.
-     */
-    fun listen(onReceive: (data: String, remoteAddress: String) -> Unit)
+    // Unicast send (Reply to a specific device)
+    fun sendTo(data: String, address: String, port: Int)
 
-    /**
-     * Stops the UDP listener and releases the socket.
-     */
+    // Listen with port info
+    fun listen(onReceive: (data: String, remoteAddress: String, remotePort: Int) -> Unit)
+
     fun stop()
 }

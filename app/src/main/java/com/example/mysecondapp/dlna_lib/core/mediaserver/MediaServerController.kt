@@ -5,6 +5,7 @@ import com.example.mysecondapp.dlna_lib.api.DlnaConfig
 import com.example.mysecondapp.dlna_lib.api.media.*
 import com.example.mysecondapp.dlna_lib.core.lifecycle.dlnaScope
 import com.example.mysecondapp.dlna_lib.core.logging.DlnaLogger
+import com.example.mysecondapp.dlna_lib.core.ssdp.SsdpController // NEW IMPORT
 import com.example.mysecondapp.dlna_lib.platform.*
 import kotlinx.coroutines.*
 import java.util.UUID
@@ -18,7 +19,8 @@ internal class MediaServerController(
     private val httpServer: HttpServer,
     private val mimeResolver: MimeTypeResolver,
     private val networkInfo: NetworkInfoProvider,
-    private val ssdpTransport: SsdpTransport
+    private val ssdpTransport: SsdpTransport,
+    private val ssdpController: SsdpController // <--- ADDED THIS
 ) {
     private val tag = "MediaServerController"
 
@@ -48,7 +50,12 @@ internal class MediaServerController(
 
             DlnaLogger.d(tag, "Media Server started on port $boundPort with UDN: $serverUuid")
 
-            // 2. Start SSDP Advertising Loop
+            // 2. FIX: Register with SSDP Controller so it can respond to M-SEARCH requests
+            val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
+            val location = "http://$ip:$boundPort/description.xml"
+            ssdpController.setServerInfo(serverUuid, location) // <--- ADDED THIS
+
+            // 3. Start SSDP Advertising Loop (for NOTIFY messages)
             startAdvertising()
 
         } catch (e: Exception) {
@@ -202,7 +209,7 @@ internal class MediaServerController(
         return HttpResponse(200, mimeType = "text/xml", body = wrapSoap(body))
     }
 
-    // --- 4. DIDL GENERATION ---
+    // --- 4. DIDL GENERATION (FIXED URL LOGIC) ---
 
     private fun generateDidl(items: List<MediaObject>): String {
         val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
@@ -226,16 +233,21 @@ internal class MediaServerController(
                 val resource = obj.resources.firstOrNull()
                 val mime = resource?.mimeType ?: "application/octet-stream"
 
-                // CHANGE 1: Append the actual filename (or safe title) to the URL.
-                // This matches your Reference File logic (Line 173).
-                // Result: http://.../content/123/MyMovie.mp4
-                Log.d("MediaServerController", "from generateDidl(), mime: ${mime}")
+                // FIX: Trust existing extension if present, otherwise append based on mime
                 val safeTitle = obj.title.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
-                Log.d("MediaServerController", "from generateDidl(), safeTitle: ${safeTitle}")
-                val extension = if (mime.contains("video")) ".mp4" else if (mime.contains("audio")) ".mp3" else ".jpg"
-//                val finalName = if (safeTitle.endsWith(extension)) safeTitle else "$safeTitle$extension"
-                val finalName = safeTitle
-                Log.d("MediaServerController", "from generateDidl(), finalName: ${finalName}")
+                val finalName = if (safeTitle.contains(".")) {
+                    // Title already has an extension (e.g., "Movie.mkv")
+                    safeTitle
+                } else {
+                    // Append extension based on mime type
+                    val ext = when {
+                        mime.startsWith("video") -> ".mp4" // Safest fallback for video
+                        mime.startsWith("audio") -> ".mp3"
+                        mime.startsWith("image") -> ".jpg"
+                        else -> "" // No extension
+                    }
+                    "$safeTitle$ext"
+                }
 
                 val url = "$baseUrl/content/$id/$finalName"
 
@@ -243,8 +255,8 @@ internal class MediaServerController(
                 sb.append("<dc:title>$title</dc:title>")
                 sb.append("<upnp:class>$upnpClass</upnp:class>")
 
-                // CHANGE 2: Use OP=01 (Byte Seek) to match Reference File Line 99
-                val dlnaFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+                // Flags: OP=01 (Byte Seek) for better TV compatibility
+                val dlnaFlags = "DLNA.ORG_PN=AVC_MP4_BL_CIF15_AAC_520;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
                 sb.append("""<res protocolInfo="http-get:*:$mime:$dlnaFlags">$url</res>""")
 
@@ -255,12 +267,11 @@ internal class MediaServerController(
                 sb.append("</item>")
             }
         }
-
         sb.append("</DIDL-Lite>")
         return sb.toString()
     }
 
-    // --- 5. SSDP ADVERTISING ---
+    // --- 5. SSDP ADVERTISING (for NOTIFY) ---
 
     private fun startAdvertising() {
         advJob = dlnaScope.launch(Dispatchers.IO) {
@@ -273,6 +284,11 @@ internal class MediaServerController(
 
     private suspend fun sendSsdp(alive: Boolean) {
         val ip = networkInfo.getCurrentIpAddress() ?: return
+//        val msg = "IP from startAdvertising(): $ip"
+//        msg.forEachIndexed { index, ch ->
+//            Log.d("MediaServerController", "[$index] '$ch'")
+//        }
+
         val location = "http://$ip:$boundPort/description.xml"
         val nts = if (alive) "ssdp:alive" else "ssdp:byebye"
 
@@ -294,20 +310,21 @@ internal class MediaServerController(
     }
 
     private fun buildSsdpPacket(nt: String, usnUuid: String, location: String, nts: String): String {
-        // USN format: uuid:device-UUID::urn:device-type... or just uuid:device-UUID
         val usn = if (nt == usnUuid) usnUuid else "$usnUuid::$nt"
 
-        return """
-            NOTIFY * HTTP/1.1
-            HOST: 239.255.255.250:1900
-            CACHE-CONTROL: max-age=1800
-            LOCATION: $location
-            NT: $nt
-            NTS: $nts
-            SERVER: Android/1.0 DLNA-Lib/1.0 UPnP/1.0
-            USN: $usn
-            
-        """.trimIndent().replace("\n", "\r\n")
+        // FIX: Explicitly format with \r\n to ensure strict compliance.
+        // Kotlin's trimIndent() + replace() can be risky for the final double CRLF.
+        return StringBuilder()
+            .append("NOTIFY * HTTP/1.1\r\n")
+            .append("HOST: 239.255.255.250:1900\r\n")
+            .append("CACHE-CONTROL: max-age=1800\r\n")
+            .append("LOCATION: $location\r\n")
+            .append("NT: $nt\r\n")
+            .append("NTS: $nts\r\n")
+            .append("SERVER: Android/1.0 DLNA-Lib/1.0 UPnP/1.0\r\n")
+            .append("USN: $usn\r\n")
+            .append("\r\n") // The second CRLF that TVs require
+            .toString()
     }
 
     // --- HELPERS ---
@@ -343,10 +360,20 @@ internal class MediaServerController(
             val doc = builder.parse(InputSource(StringReader(xml)))
             doc.documentElement.normalize()
 
-            // Look for specific arguments we know (ObjectID, etc) inside Body
-            // A generic traversal is safer
             val body = doc.getElementsByTagNameNS("*", "Body").item(0) as? Element
-            val action = body?.childNodes?.item(1) as? Element // First child is the Action
+
+            // FIX: Find the first ELEMENT child (Action), ignoring whitespace/text nodes
+            var action: Element? = null
+            if (body != null) {
+                val children = body.childNodes
+                for (i in 0 until children.length) {
+                    val node = children.item(i)
+                    if (node.nodeType == org.w3c.dom.Node.ELEMENT_NODE) {
+                        action = node as Element
+                        break
+                    }
+                }
+            }
 
             if (action != null) {
                 val children = action.childNodes
@@ -357,7 +384,9 @@ internal class MediaServerController(
                     }
                 }
             }
-        } catch (e: Exception) { /* ignore */ }
+        } catch (e: Exception) {
+            DlnaLogger.w(tag, "SOAP Parse Error: ${e.message}")
+        }
         return map
     }
 
