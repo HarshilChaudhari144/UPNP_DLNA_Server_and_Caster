@@ -16,84 +16,74 @@ import com.example.mysecondapp.dlna_lib.core.ssdp.SsdpController
 import com.example.mysecondapp.dlna_lib.platform.DlnaPlatform
 
 internal class DlnaEngine(
-    private val config: DlnaConfig,
-    private val platform: DlnaPlatform
+    config: DlnaConfig,
+    platform: DlnaPlatform
 ) {
 
     private val tag = "DlnaEngine"
 
-    // --- 1. Infrastructure ---
+    // --- 1. Infrastructure (Client & Server) ---
     private val soapClient = SoapClient()
-
-    // Handles GENA (Eventing) - Wrapper around platform.eventServer
     private val subscriptionManager = SubscriptionManager(platform.eventServer)
 
-    // --- 2. Discovery Components ---
+    // --- 2. Discovery Components (Client) ---
     val deviceRepository = DeviceRepository()
-
     val deviceRegistry: DeviceRegistry = object : DeviceRegistry {
         override val devices = deviceRepository.devices
         override fun getDevice(deviceId: String) = deviceRepository.getDevice(deviceId)
         override fun getMediaServers() = deviceRepository.getServers()
         override fun getMediaRenderers() = deviceRepository.getRenderers()
     }
-
     private val descriptorParser = DeviceDescriptorParser()
     private val deviceStateMachine = DeviceStateMachine(deviceRepository, descriptorParser)
     private val ssdpCache = SsdpCache(deviceStateMachine)
-
-    // SsdpController is responsible for both client M-SEARCH and server M-SEARCH response
     private val ssdpController = SsdpController(platform.ssdp, deviceStateMachine, ssdpCache)
 
-    // --- 3. Functional Controllers ---
-
+    // --- 3. Functional Controllers (Client) ---
     val browseController = BrowseController(deviceRepository, soapClient)
+    val playbackController = PlaybackController(deviceRepository, soapClient, subscriptionManager)
 
-    // Playback Logic
-    val playbackController = PlaybackController(
-        deviceRepository,
-        soapClient,
-        subscriptionManager
-    )
-
-    // Local Media Server (Now Enabled)
-    // FIX: Pass ssdpController so MediaServerController can register its info with it.
-    val mediaServerController = if (config.enableMediaServer && config.contentProvider != null) {
+    // --- 4. Media Server Controller (Server) ---
+    // Instantiated but not started until requested.
+    val mediaServerController = if (config.contentProvider != null) {
         MediaServerController(
             config = config,
             httpServer = platform.httpServer,
             mimeResolver = platform.mimeResolver,
             networkInfo = platform.networkInfo,
             ssdpTransport = platform.ssdp,
-            ssdpController = ssdpController // <--- ADDED THIS
+            ssdpController = ssdpController
         )
     } else null
 
-    fun start() {
-        DlnaLogger.d(tag, "Engine Starting...")
-
-        // 1. Start Network stuff
+    fun startClient() {
+        DlnaLogger.d(tag, "Starting Client Engine components...")
+        // Start network discovery and event listening
         ssdpController.start()
-
-        // 2. Start Event Listening
         subscriptionManager.start()
-
-        // 3. Start Media Server (if enabled)
-        mediaServerController?.start()
-
-        DlnaLogger.d(tag, "Engine Started.")
+        DlnaLogger.d(tag, "Client Engine components started.")
     }
 
-    fun stop() {
-        DlnaLogger.d(tag, "Engine Stopping...")
-
+    fun stopClient() {
+        DlnaLogger.d(tag, "Stopping Client Engine components...")
         ssdpController.stop()
         subscriptionManager.stop()
-        mediaServerController?.stop()
-
-        // Clear devices on stop so we don't show stale ones next time
+        // Clear discovered devices when the client stops
         deviceRepository.clear()
+        DlnaLogger.d(tag, "Client Engine components stopped.")
+    }
 
-        DlnaLogger.d(tag, "Engine Stopped.")
+    fun startServer() {
+        DlnaLogger.d(tag, "Starting Server Engine component...")
+        // Only start the media server part
+        mediaServerController?.start()
+        DlnaLogger.d(tag, "Server Engine component started.")
+    }
+
+    fun stopServer() {
+        DlnaLogger.d(tag, "Stopping Server Engine component...")
+        // Only stop the media server part
+        mediaServerController?.stop()
+        DlnaLogger.d(tag, "Server Engine component stopped.")
     }
 }

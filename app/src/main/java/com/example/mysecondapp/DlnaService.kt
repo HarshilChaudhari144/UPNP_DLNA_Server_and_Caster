@@ -14,21 +14,19 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.example.mysecondapp.dlna_lib.android.AndroidDlnaPlatform
-import com.example.mysecondapp.dlna_lib.api.DlnaConfig
 import com.example.mysecondapp.dlna_lib.api.DlnaManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
-import java.util.UUID
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 class DlnaService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    // Both locks are required for background operation.
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
@@ -38,6 +36,9 @@ class DlnaService : Service() {
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "DLNA_SERVER_CHANNEL"
         private const val TAG = "DlnaService"
+
+        private val _isRunning = MutableStateFlow(false)
+        val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -45,28 +46,24 @@ class DlnaService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service onCreate")
+        _isRunning.value = true
         acquireLocks()
         createNotificationChannel()
     }
 
     private fun acquireLocks() {
         try {
-            // 1. CPU WakeLock (Keeps the processor from sleeping)
             val powerManager = getSystemService(POWER_SERVICE) as PowerManager
             wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DlnaApp:ServiceWakeLock")
             wakeLock?.setReferenceCounted(false)
             wakeLock?.acquire()
 
-            // 2. WiFi Lock (Keeps the WiFi radio active)
             val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "DlnaApp:ServiceWifiLock")
             wifiLock?.setReferenceCounted(false)
             wifiLock?.acquire()
 
             Log.i(TAG, "WakeLock and WifiLock acquired successfully.")
-
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Failed to acquire locks. Ensure WAKE_LOCK permission is in Manifest.", e)
         } catch (e: Exception) {
             Log.e(TAG, "Error acquiring locks", e)
         }
@@ -74,14 +71,9 @@ class DlnaService : Service() {
 
     private fun releaseLocks() {
         try {
-            if (wakeLock?.isHeld == true) {
-                wakeLock?.release()
-                Log.i(TAG, "WakeLock released.")
-            }
-            if (wifiLock?.isHeld == true) {
-                wifiLock?.release()
-                Log.i(TAG, "WifiLock released.")
-            }
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+            Log.i(TAG, "All locks released.")
         } catch (e: Exception) {
             Log.e(TAG, "Error releasing locks", e)
         }
@@ -89,74 +81,55 @@ class DlnaService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startDlnaSystem()
-            ACTION_STOP -> stopDlnaSystem()
+            ACTION_START -> startServer()
+            ACTION_STOP -> stopServer()
         }
         return START_STICKY
     }
 
-    private fun startDlnaSystem() {
+    private fun startServer() {
         try {
-            val notification = createNotification()
+            // The DlnaManager client engine should already be initialized by the ViewModel.
+            // This service now only tells it to turn on the server component.
+            if (DlnaManager.isInitialized()) {
+                Log.d(TAG, "Starting media server component...")
+                DlnaManager.startMediaServer()
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-
-            serviceScope.launch {
-                try {
-                    if (!DlnaManager.isInitialized()) {
-                        initializeDlnaManager()
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "CRITICAL: Failed to initialize DlnaManager", e)
-                    stopDlnaSystem()
+                val notification = createNotification()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
                 }
+            } else {
+                Log.e(TAG, "Cannot start server: DlnaManager not initialized by the app's UI yet.")
+                stopSelf() // Stop if the main app isn't running
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Foreground Service", e)
+            Log.e(TAG, "Failed to start Foreground Service or Server", e)
             stopSelf()
         }
     }
 
-    private fun initializeDlnaManager() {
-        Log.d(TAG, "Initializing DLNA Manager...")
-        val prefs = getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
-        val savedFolders = prefs.getStringSet("shared_folders", emptySet()) ?: emptySet()
-        var serverUdn = prefs.getString("server_udn", null) ?: UUID.randomUUID().toString()
-        prefs.edit().putString("server_udn", serverUdn).apply()
-
-        val myContentProvider = MediaStoreContentProvider(this)
-        myContentProvider.setAllowedFolders(savedFolders)
-
-        val config = DlnaConfig(
-            enableMediaServer = true,
-            serverName = "Android (${Build.MODEL})",
-            serverUdn = serverUdn,
-            contentProvider = myContentProvider
-        )
-
-        val platform = AndroidDlnaPlatform(this)
-        DlnaManager.start(config, platform)
-        Log.i(TAG, "DLNA Manager Initialized and Started.")
-    }
-
-    private fun stopDlnaSystem() {
+    private fun stopServer() {
         try {
-            DlnaManager.stop()
+            Log.d(TAG, "Stopping media server component...")
+            DlnaManager.stopMediaServer()
             stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            stopSelf() // This will trigger onDestroy
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping service", e)
+            Log.e(TAG, "Error stopping server", e)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         Log.d(TAG, "Service onDestroy")
-        DlnaManager.stop()
+        _isRunning.value = false
+        // We only stop the server component here. The client engine is managed by the ViewModel.
+        if (DlnaManager.isInitialized()) {
+            DlnaManager.stopMediaServer()
+        }
         serviceScope.cancel()
         releaseLocks()
     }

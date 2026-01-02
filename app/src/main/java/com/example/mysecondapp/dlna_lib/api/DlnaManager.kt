@@ -15,98 +15,101 @@ object DlnaManager {
     private var engine: DlnaEngine? = null
 
     // Public APIs backed by the Core Engine.
-    // We use lateinit, but we guarantee initialization in start().
-
+    // We use lateinit, but we guarantee initialization in startClientEngine().
     lateinit var devices: DeviceRegistry
         private set
-
     lateinit var browser: BrowseApi
         private set
-
     lateinit var playback: PlaybackApi
         private set
-
     lateinit var mediaServer: MediaServerApi
         private set
 
     /**
-     * Checks if the Manager has been started and the engine is running.
-     * Useful for UI components waiting for the Service to initialize the library.
+     * Checks if the Manager's client engine has been started.
      */
     fun isInitialized(): Boolean {
         return engine != null
     }
 
     /**
-     * Initializes the DLNA Library.
+     * Initializes the client-side components of the DLNA Library (Discovery, Control).
      * This MUST be called before accessing any other properties.
      */
-    fun start(config: DlnaConfig, platform: DlnaPlatform) {
-        // 1. Prevent double initialization
+    fun startClientEngine(config: DlnaConfig, platform: DlnaPlatform) {
         if (engine != null) {
-            stop()
+            // If already running, just return. Or consider a soft restart.
+            return
         }
 
-        // 2. Instantiate the Core Engine
+        // 1. Instantiate the Core Engine
         val newEngine = DlnaEngine(config, platform)
 
-        // 3. Bind Public APIs to Core Controllers immediately
-        // This prevents UninitializedPropertyAccessException
+        // 2. Bind Public APIs to Core Controllers
         devices = newEngine.deviceRegistry
         browser = newEngine.browseController
         playback = newEngine.playbackController
 
-        // 4. Create the MediaServer API Wrapper
+        // 3. Create the MediaServer API Wrapper
+        // This wrapper now delegates to the new granular engine controls.
         mediaServer = object : MediaServerApi {
-            // Shadow state since Controller doesn't expose Flow yet
             private val _isRunning = MutableStateFlow(false)
             override val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
 
             override fun start() {
-                // Only start if enabled in config and controller exists
-                newEngine.mediaServerController?.let { controller ->
-                    controller.start()
-                    _isRunning.value = true
-                }
+                // This will be called by the service, which calls the public startMediaServer()
+                newEngine.startServer()
+                _isRunning.value = true
             }
 
             override fun stop() {
-                newEngine.mediaServerController?.let { controller ->
-                    controller.stop()
-                    _isRunning.value = false
-                }
+                // This will be called by the service, which calls the public stopMediaServer()
+                newEngine.stopServer()
+                _isRunning.value = false
             }
 
             override fun refreshContent() {
-                // TODO: MediaServerController does not yet support dynamic updates (SystemUpdateID).
-                // This is a placeholder for future implementation.
+                // Future implementation
             }
         }
 
-        // 5. Start the Engine Lifecycle
-        newEngine.start()
+        // 4. Start only the Client-side components of the Engine
+        newEngine.startClient()
 
-        // 6. If config enabled it, mark our API wrapper state as true
-        if (config.enableMediaServer && newEngine.mediaServerController != null) {
-            // The engine.start() calls mediaServerController.start() internally,
-            // so we should reflect that in our state flow.
-            (mediaServer.isRunning as? MutableStateFlow)?.value = true
-        }
-
-        // 7. Store reference
+        // 5. Store engine reference
         engine = newEngine
     }
 
     /**
-     * Stops the library, releases network locks, and clears device lists.
+     * Stops the client-side components of the library, releases network locks, and clears device lists.
+     * Does NOT stop the media server if it's running in its service.
      */
-    fun stop() {
-        engine?.stop()
+    fun stopClientEngine() {
+        engine?.stopClient()
         engine = null
 
-        // Reset MediaServer state if possible
+        // Reset the isInitialized state for mediaServer as well, but don't stop it
         if (::mediaServer.isInitialized) {
             (mediaServer.isRunning as? MutableStateFlow)?.value = false
         }
+    }
+
+    /**
+     * Starts the local media server component of an already initialized engine.
+     * Intended to be called from the DlnaService.
+     */
+    fun startMediaServer() {
+        // The engine must be initialized first (by the UI)
+        if (!isInitialized()) return
+        mediaServer.start()
+    }
+
+    /**
+     * Stops the local media server component.
+     * Intended to be called from the DlnaService.
+     */
+    fun stopMediaServer() {
+        if (!isInitialized()) return
+        mediaServer.stop()
     }
 }

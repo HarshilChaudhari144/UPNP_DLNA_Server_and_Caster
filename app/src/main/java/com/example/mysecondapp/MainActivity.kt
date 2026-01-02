@@ -25,6 +25,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.mysecondapp.dlna_lib.android.AndroidDlnaPlatform
+import com.example.mysecondapp.dlna_lib.api.DlnaConfig
 import com.example.mysecondapp.dlna_lib.api.DlnaManager
 import com.example.mysecondapp.dlna_lib.api.browse.BrowseResult
 import com.example.mysecondapp.dlna_lib.api.device.Device
@@ -33,12 +35,14 @@ import com.example.mysecondapp.dlna_lib.api.media.MediaItem
 import com.example.mysecondapp.dlna_lib.api.playback.PlaybackState
 import com.example.mysecondapp.dlna_lib.api.playback.TransportState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.UUID
 import kotlin.time.Duration.Companion.seconds
 
 class MainActivity : ComponentActivity() {
@@ -57,10 +61,9 @@ fun DlnaApp() {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             val viewModel = viewModel<DlnaViewModel>()
-            val context = LocalContext.current
 
             PermissionWrapper(onPermissionsGranted = {
-                viewModel.startDlna(context)
+                viewModel.initializeClient() // Client engine starts with the UI
             }) {
                 val currentScreen by viewModel.currentScreen.collectAsState()
                 val selectedMedia by viewModel.selectedMediaItem.collectAsState()
@@ -98,7 +101,8 @@ fun PermissionWrapper(
                 Manifest.permission.NEARBY_WIFI_DEVICES,
                 Manifest.permission.READ_MEDIA_VIDEO,
                 Manifest.permission.READ_MEDIA_AUDIO,
-                Manifest.permission.READ_MEDIA_IMAGES
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.POST_NOTIFICATIONS
             )
         } else {
             arrayOf(
@@ -161,18 +165,18 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     private val _sharedFolderIds = MutableStateFlow<Set<String>>(emptySet())
     val sharedFolderIds: StateFlow<Set<String>> = _sharedFolderIds.asStateFlow()
 
-    // --- New properties for Battery Optimization ---
     private val _isIgnoringBatteryOptimizations = MutableStateFlow(isIgnoringBatteryOptimizations())
     val isIgnoringBatteryOptimizations: StateFlow<Boolean> = _isIgnoringBatteryOptimizations.asStateFlow()
-    // ---
+
+    val isServerRunning: StateFlow<Boolean> = DlnaService.isRunning
+    private var dataCollectorJob: Job? = null
 
     private var contentProvider: MediaStoreContentProvider? = null
     private var currentDeviceId: String? = null
     private var activeContainerId: String = "0"
     private val historyStack = mutableListOf<Pair<String, String>>()
-    private var isStarted = false
+    private var isClientInitialized = false
 
-    // --- New functions for Battery Optimization ---
     private fun isIgnoringBatteryOptimizations(): Boolean {
         val powerManager = getApplication<Application>().getSystemService(Context.POWER_SERVICE) as PowerManager
         return powerManager.isIgnoringBatteryOptimizations(getApplication<Application>().packageName)
@@ -183,7 +187,6 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun requestDisableBatteryOptimizations(context: Context) {
-        // This must be called from an Activity, not the Application context
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val intent = Intent().apply {
                 action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
@@ -192,43 +195,64 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
             context.startActivity(intent)
         }
     }
-    // ---
 
-    fun startDlna(context: Context) {
-        if (isStarted) return
-        isStarted = true
+    fun initializeClient() {
+        if (isClientInitialized) return
+        isClientInitialized = true
 
-        // Check battery status on start
+        val context = getApplication<Application>().applicationContext
         checkForBatteryOptimizations()
 
-        val intent = Intent(context, DlnaService::class.java).apply {
-            action = DlnaService.ACTION_START
+        // Setup the content provider for folder selection, regardless of server state
+        val prefs = context.getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
+        val savedFolders = prefs.getStringSet("shared_folders", emptySet()) ?: emptySet()
+        _sharedFolderIds.value = savedFolders
+        val myContentProvider = MediaStoreContentProvider(context)
+        myContentProvider.setAllowedFolders(savedFolders)
+        this.contentProvider = myContentProvider
+
+        // Create the necessary components to start the client engine
+        val config = DlnaConfig(
+            // Server config is still needed for device info, even if server doesn't auto-start
+            serverName = "Android (${Build.MODEL})",
+            serverUdn = prefs.getString("server_udn", null) ?: UUID.randomUUID().toString().also {
+                prefs.edit().putString("server_udn", it).apply()
+            },
+            contentProvider = myContentProvider,
+            enableMediaServer = true
+        )
+        val platform = AndroidDlnaPlatform(context)
+
+        // Start the client engine for discovery
+        DlnaManager.startClientEngine(config, platform)
+        startDataCollectors()
+    }
+
+    private fun startDataCollectors() {
+        dataCollectorJob?.cancel()
+        dataCollectorJob = viewModelScope.launch {
+            while (!DlnaManager.isInitialized()) {
+                delay(100)
+            }
+            launch { DlnaManager.devices.devices.collect { _devices.value = it } }
+            launch { DlnaManager.playback.playbackState.collect { _playbackState.value = it } }
         }
+    }
+
+    fun startServer() {
+        val context = getApplication<Application>().applicationContext
+        val intent = Intent(context, DlnaService::class.java).apply { action = DlnaService.ACTION_START }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {
             context.startService(intent)
         }
+    }
 
-        val prefs = context.getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
-        val savedFolders = prefs.getStringSet("shared_folders", emptySet()) ?: emptySet()
-        _sharedFolderIds.value = savedFolders
-
-        val myContentProvider = MediaStoreContentProvider(context)
-        myContentProvider.setAllowedFolders(savedFolders)
-        this.contentProvider = myContentProvider
-
-        viewModelScope.launch {
-            while (!DlnaManager.isInitialized()) {
-                delay(200)
-            }
-            launch {
-                DlnaManager.devices.devices.collect { _devices.value = it }
-            }
-            launch {
-                DlnaManager.playback.playbackState.collect { _playbackState.value = it }
-            }
-        }
+    fun stopServer() {
+        val context = getApplication<Application>().applicationContext
+        val intent = Intent(context, DlnaService::class.java).apply { action = DlnaService.ACTION_STOP }
+        context.startService(intent)
     }
 
     fun openSettings() {
@@ -252,6 +276,8 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
         context.getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
             .edit().putStringSet("shared_folders", current).apply()
     }
+
+    // --- All other functions (connectToRenderer, browse, etc.) remain unchanged ---
 
     fun connectToRenderer(device: Device) {
         if (!DlnaManager.isInitialized()) return
@@ -352,6 +378,9 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
-        // Intentionally empty to keep service alive
+        // Gracefully shut down the client engine when the app is fully closed.
+        if (DlnaManager.isInitialized()) {
+            DlnaManager.stopClientEngine()
+        }
     }
 }

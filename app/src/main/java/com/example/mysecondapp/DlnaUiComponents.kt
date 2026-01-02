@@ -43,19 +43,35 @@ fun DeviceListScreen(viewModel: DlnaViewModel) {
             )
         }
     ) { paddingValues ->
-        Column(modifier = Modifier.fillMaxSize().padding(paddingValues).padding(16.dp)) {
-            Text("Discovered Devices", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 16.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // This card correctly handles starting and stopping the local server
+            ServerControlCard(viewModel = viewModel)
 
+            HorizontalDivider()
+            Text("Discovered Devices", style = MaterialTheme.typography.titleLarge)
+
+            // --- CORRECTED LOGIC ---
+            // The client engine is always running, so if the device list is empty,
+            // it means we are actively scanning.
             if (devices.isEmpty()) {
-                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         CircularProgressIndicator()
                         Spacer(Modifier.height(16.dp))
-                        Text("Scanning...")
+                        Text("Scanning for devices on your network...")
                     }
                 }
             } else {
-                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     items(devices) { device ->
                         DeviceCard(
                             device = device,
@@ -408,6 +424,49 @@ fun BatteryOptimizationCard(viewModel: DlnaViewModel) {
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                 ) {
                     Text("Open System Settings")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ServerControlCard(viewModel: DlnaViewModel) {
+    val isServerRunning by viewModel.isServerRunning.collectAsState()
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column {
+                Text("Local Server", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    text = if (isServerRunning) "Running" else "Stopped",
+                    color = if (isServerRunning) MaterialTheme.colorScheme.primary else Color.Gray,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+            if (isServerRunning) {
+                Button(
+                    onClick = { viewModel.stopServer() },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Icon(Icons.Default.Stop, contentDescription = "Stop")
+                    Spacer(Modifier.width(8.dp))
+                    Text("Stop")
+                }
+            } else {
+                Button(onClick = { viewModel.startServer() }) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "Start")
+                    Spacer(Modifier.width(8.dp))
+                    Text("Start")
                 }
             }
         }
