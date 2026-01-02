@@ -673,6 +673,12 @@ fun BrowserScreen(viewModel: DlnaViewModel) {
                 items(browseResult?.containers ?: emptyList()) { folder ->
                     ListItem(
                         headlineContent = { Text(folder.title, fontWeight = FontWeight.Medium) },
+                        supportingContent = {
+                            Column() {
+                                Text("ChildCount: ${folder.childCount}", fontSize = 12.sp)
+                                Text("Searchable: ${folder.searchable}", fontSize = 12.sp)
+                            }
+                        },
                         leadingContent = { Icon(Icons.Default.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.secondary) },
                         modifier = Modifier.clickable { viewModel.browse(folder.id, folder.title) }
                     )
@@ -687,11 +693,13 @@ fun BrowserScreen(viewModel: DlnaViewModel) {
                             Column {
                                 Text(text = info?.mimeType ?: "Unknown Format", fontSize = 12.sp)
                                 Text(text = "Dur: ${info?.duration} | Size: ${info?.size}", fontSize = 12.sp)
+                                Text(text = "Date: ${file.date}", fontSize = 12.sp)
                                 Text(text = "Resources: ${file.resources}", fontSize = 12.sp)
                                 Text(text = "Thumbnail: ${file.thumbnail}", fontSize = 12.sp)
                                 Text(text = "Uri: ${info?.uri}", fontSize = 12.sp)
                                 Text(text = "Resolution: ${info?.resolution}", fontSize = 12.sp)
                                 Text(text = "ProtocolInfo: ${info?.protocolInfo}", fontSize = 12.sp)
+
                             }
                         },
                         leadingContent = { Icon(Icons.Default.MusicNote, contentDescription = null) },

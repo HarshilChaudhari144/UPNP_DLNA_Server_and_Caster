@@ -37,7 +37,8 @@ data class MediaItem(
     val upnpClass: String, // e.g., "object.item.videoItem"
     val mediaType: MediaType,
     val resources: List<MediaResource>,
-    val thumbnail: MediaThumbnail? = null
+    val thumbnail: MediaThumbnail? = null,
+    val date: Long? = null // <--- ADD THIS (Timestamp in Milliseconds)
 ) : MediaObject
 
 /**

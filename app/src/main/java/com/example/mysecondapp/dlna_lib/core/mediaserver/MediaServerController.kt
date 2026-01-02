@@ -44,7 +44,8 @@ internal class MediaServerController(
 
         try {
             // 1. Start HTTP Server on random port (0)
-            httpServer.start(0, ServerRouter())
+//            httpServer.start(0, ServerRouter())
+            httpServer.start(8300, ServerRouter())
             boundPort = httpServer.getPort()
             isRunning = true
 
@@ -412,8 +413,9 @@ internal class MediaServerController(
             if (obj is MediaContainer) {
                 // FIX: Add childCount if available (some TVs hide folders without this)
                 val childCountAttr = if (obj.childCount != null) " childCount=\"${obj.childCount}\"" else ""
-
-                sb.append("""<container id="$id" parentID="$parent" restricted="1" searchable="0"$childCountAttr>""")
+                // FIX: Write searchable flag (static 0 or 1 based on obj.searchable)
+                val isSearchable = if (obj.searchable) "1" else "0"
+                sb.append("""<container id="$id" parentID="$parent" restricted="1" searchable="$isSearchable"$childCountAttr>""")
                 sb.append("<dc:title>$title</dc:title>")
                 // FIX: Use standard storageFolder class
                 sb.append("<upnp:class>object.container.storageFolder</upnp:class>")
@@ -422,6 +424,16 @@ internal class MediaServerController(
                 val upnpClass = obj.upnpClass
                 val resource = obj.resources.firstOrNull()
                 val mime = resource?.mimeType ?: "application/octet-stream"
+                // 1. FORMAT SIZE & DURATION
+                // The TV needs these attributes inside the <res> tag to show info
+                val sizeAttr = if (resource?.size != null && resource.size > 0) " size=\"${resource.size}\"" else ""
+
+                val durationAttr = if (resource?.duration != null) {
+                    val durStr = formatDuration(resource.duration.inWholeMilliseconds)
+                    " duration=\"$durStr\""
+                } else ""
+                // FIX: Add Resolution Attribute
+                val resAttr = if (resource?.resolution != null) " resolution=\"${resource.resolution}\"" else ""
 
                 // FIX: Trust existing extension if present, otherwise append based on mime
                 val safeTitle = obj.title.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
@@ -443,12 +455,18 @@ internal class MediaServerController(
 
                 sb.append("""<item id="$id" parentID="$parent" restricted="1">""")
                 sb.append("<dc:title>$title</dc:title>")
+                // FIX: Add Date Tag
+                if (obj.date != null) {
+                    val dateStr = formatDate(obj.date)
+                    sb.append("<dc:date>$dateStr</dc:date>")
+                }
                 sb.append("<upnp:class>$upnpClass</upnp:class>")
 
                 // Flags: OP=01 (Byte Seek) for better TV compatibility
                 val dlnaFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
-                sb.append("""<res protocolInfo="http-get:*:$mime:$dlnaFlags">$url</res>""")
+//                sb.append("""<res protocolInfo="http-get:*:$mime:$dlnaFlags">$url</res>""")
+                sb.append("""<res protocolInfo="http-get:*:$mime:$dlnaFlags"$sizeAttr$durationAttr$resAttr>$url</res>""")
 
                 if (config.thumbnailProvider != null) {
                     val thumbUrl = "$baseUrl/thumb/${id}"
@@ -459,6 +477,20 @@ internal class MediaServerController(
         }
         sb.append("</DIDL-Lite>")
         return sb.toString()
+    }
+
+    private fun formatDuration(millis: Long): String {
+        val seconds = millis / 1000
+        val h = seconds / 3600
+        val m = (seconds % 3600) / 60
+        val s = seconds % 60
+        return String.format("%d:%02d:%02d.000", h, m, s)
+    }
+
+    private fun formatDate(millis: Long): String {
+        // Simple YYYY-MM-DD format
+        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+        return sdf.format(java.util.Date(millis))
     }
 
     // --- 5. SSDP ADVERTISING (for NOTIFY) ---

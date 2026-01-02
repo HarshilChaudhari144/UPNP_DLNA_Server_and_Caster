@@ -139,6 +139,10 @@ internal class DidlLiteParser {
 
         if (id.isEmpty()) return null
 
+        // FIX: Parse Date (dc:date)
+        val dateStr = getTagValue(element, "date")
+        val date = parseDateToMillis(dateStr)
+
         val resources = parseResources(element)
         val mediaType = determineMediaType(upnpClass, resources)
 
@@ -154,8 +158,21 @@ internal class DidlLiteParser {
             upnpClass = upnpClass,
             mediaType = mediaType,
             resources = resources,
-            thumbnail = thumbnail
+            thumbnail = thumbnail,
+            date = date // <--- Pass the parsed date
         )
+    }
+
+    // Add this helper function
+    private fun parseDateToMillis(dateStr: String?): Long? {
+        if (dateStr.isNullOrBlank()) return null
+        return try {
+            // Try ISO 8601 (YYYY-MM-DD)
+            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+            sdf.parse(dateStr)?.time
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun parseResources(itemElement: Element): List<MediaResource> {

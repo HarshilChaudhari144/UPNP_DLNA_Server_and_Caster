@@ -63,7 +63,10 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
             MediaStore.Files.FileColumns.SIZE,
             MediaStore.Files.FileColumns.DURATION,
             MediaStore.Files.FileColumns.MEDIA_TYPE,
-            MediaStore.Files.FileColumns.BUCKET_ID
+            MediaStore.Files.FileColumns.BUCKET_ID,
+            MediaStore.Files.FileColumns.DATE_ADDED, // <--- ADD THIS
+            MediaStore.Files.FileColumns.WIDTH,  // <--- NEW
+            MediaStore.Files.FileColumns.HEIGHT  // <--- NEW
         )
         val selection = "${MediaStore.Files.FileColumns._ID} = ?"
 
@@ -96,6 +99,8 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
 
     private fun getFoldersInternal(filterAllowed: Boolean): List<MediaObject> {
         val folders = mutableMapOf<String, String>()
+        // Map<BucketID, Pair<DisplayName, Count>>
+        val folderMap = mutableMapOf<String, Pair<String, Int>>()
         val projection = arrayOf(
             MediaStore.Files.FileColumns.BUCKET_ID,
             MediaStore.Files.FileColumns.BUCKET_DISPLAY_NAME
@@ -115,14 +120,29 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
                     if (idCol != -1 && nameCol != -1) {
                         val id = cursor.getString(idCol)
                         val name = cursor.getString(nameCol)
-                        if (id != null && name != null) folders[id] = name
+                        if (id != null && name != null) {
+                            // FIX: Logic to increment count for this bucket
+                            val current = folderMap[id]
+                            if (current == null) {
+                                folderMap[id] = name to 1
+                            } else {
+                                folderMap[id] = name to (current.second + 1)
+                            }
+                        }
                     }
                 }
             }
         } catch (e: Exception) { e.printStackTrace() }
 
-        return folders.map { (id, name) ->
-            MediaContainer(id = id, parentId = "0", title = name, searchable = false)
+        return folderMap.map { (id, info) ->
+            val (name, count) = info
+            MediaContainer(
+                id = id,
+                parentId = "0",
+                title = name,
+                childCount = count, // FIX: Pass the calculated count here
+                searchable = true
+            )
         }
             .filter { !filterAllowed || allowedFolderIds.contains(it.id) }
             .sortedBy { it.title }
@@ -136,7 +156,10 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
             MediaStore.Files.FileColumns.MIME_TYPE,
             MediaStore.Files.FileColumns.SIZE,
             MediaStore.Files.FileColumns.DURATION,
-            MediaStore.Files.FileColumns.MEDIA_TYPE
+            MediaStore.Files.FileColumns.MEDIA_TYPE,
+            MediaStore.Files.FileColumns.DATE_ADDED, // <--- ADD THIS
+            MediaStore.Files.FileColumns.WIDTH,  // <--- NEW
+            MediaStore.Files.FileColumns.HEIGHT  // <--- NEW
         )
         val selection = "${MediaStore.Files.FileColumns.BUCKET_ID} = ? AND ${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?, ?)"
         val selectionArgs = arrayOf(bucketId, MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(), MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO.toString(), MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString())
@@ -153,11 +176,30 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
 
     private fun mapCursorToMediaItem(cursor: Cursor, parentId: String): MediaItem {
         val id = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID))
-        val title = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)) ?: "Unknown"
+//        val title = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)) ?: "Unknown"
+        // FIX: Get raw name and strip extension
+        val rawTitle = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)) ?: "Unknown"
+        val title = rawTitle.substringBeforeLast('.') // "Movie.mkv" -> "Movie"
         val mimeType = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MIME_TYPE)) ?: "application/octet-stream"
         val size = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE))
         val durationIndex = cursor.getColumnIndex(MediaStore.Files.FileColumns.DURATION)
         val duration = if (durationIndex != -1 && !cursor.isNull(durationIndex)) cursor.getLong(durationIndex).milliseconds else null
+        // FIX: Extract Date
+        // Android returns Seconds, Java Date needs Milliseconds
+        val dateIndex = cursor.getColumnIndex(MediaStore.Files.FileColumns.DATE_ADDED)
+        val date = if (dateIndex != -1 && !cursor.isNull(dateIndex)) {
+            cursor.getLong(dateIndex) * 1000L
+        } else null
+        // FIX: Extract Resolution
+        val wIndex = cursor.getColumnIndex(MediaStore.Files.FileColumns.WIDTH)
+        val hIndex = cursor.getColumnIndex(MediaStore.Files.FileColumns.HEIGHT)
+        val resolution = if (wIndex != -1 && hIndex != -1) {
+            val w = cursor.getInt(wIndex)
+            val h = cursor.getInt(hIndex)
+            if (w > 0 && h > 0) "${w}x${h}" else null
+        } else null
+
+
         val mediaTypeInt = cursor.getInt(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MEDIA_TYPE))
 
         val (mediaType, upnpClass) = when (mediaTypeInt) {
@@ -173,10 +215,11 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
             protocolInfo = protocolInfo,
             mimeType = mimeType,
             size = size,
-            duration = duration
+            duration = duration,
+            resolution = resolution // <--- Pass it here
         )
 
-        return MediaItem(id = id, parentId = parentId, title = title, upnpClass = upnpClass, mediaType = mediaType, resources = listOf(resource))
+        return MediaItem(id = id, parentId = parentId, title = title, upnpClass = upnpClass, mediaType = mediaType, resources = listOf(resource), date = date)
     }
 
     override fun openMedia(mediaId: String): MediaDataSource {
