@@ -3,8 +3,12 @@ package com.example.mysecondapp
 import android.Manifest
 import android.app.Application
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -21,8 +25,6 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.mysecondapp.dlna_lib.android.AndroidDlnaPlatform
-import com.example.mysecondapp.dlna_lib.api.DlnaConfig
 import com.example.mysecondapp.dlna_lib.api.DlnaManager
 import com.example.mysecondapp.dlna_lib.api.browse.BrowseResult
 import com.example.mysecondapp.dlna_lib.api.device.Device
@@ -31,12 +33,12 @@ import com.example.mysecondapp.dlna_lib.api.media.MediaItem
 import com.example.mysecondapp.dlna_lib.api.playback.PlaybackState
 import com.example.mysecondapp.dlna_lib.api.playback.TransportState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.UUID
 import kotlin.time.Duration.Companion.seconds
 
 class MainActivity : ComponentActivity() {
@@ -138,7 +140,8 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentScreen = MutableStateFlow(Screen.DEVICE_LIST)
     val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
 
-    val playbackState: StateFlow<PlaybackState> get() = DlnaManager.playback.playbackState
+    private val _playbackState = MutableStateFlow(PlaybackState(transportState = TransportState.STOPPED))
+    val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
 
     private val _browseResult = MutableStateFlow<BrowseResult?>(null)
     val browseResult: StateFlow<BrowseResult?> = _browseResult.asStateFlow()
@@ -158,16 +161,55 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     private val _sharedFolderIds = MutableStateFlow<Set<String>>(emptySet())
     val sharedFolderIds: StateFlow<Set<String>> = _sharedFolderIds.asStateFlow()
 
+    // --- New properties for Battery Optimization ---
+    private val _isIgnoringBatteryOptimizations = MutableStateFlow(isIgnoringBatteryOptimizations())
+    val isIgnoringBatteryOptimizations: StateFlow<Boolean> = _isIgnoringBatteryOptimizations.asStateFlow()
+    // ---
+
     private var contentProvider: MediaStoreContentProvider? = null
     private var currentDeviceId: String? = null
     private var activeContainerId: String = "0"
     private val historyStack = mutableListOf<Pair<String, String>>()
     private var isStarted = false
 
+    // --- New functions for Battery Optimization ---
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        val powerManager = getApplication<Application>().getSystemService(Context.POWER_SERVICE) as PowerManager
+        return powerManager.isIgnoringBatteryOptimizations(getApplication<Application>().packageName)
+    }
+
+    fun checkForBatteryOptimizations() {
+        _isIgnoringBatteryOptimizations.value = isIgnoringBatteryOptimizations()
+    }
+
+    fun requestDisableBatteryOptimizations(context: Context) {
+        // This must be called from an Activity, not the Application context
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent().apply {
+                action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                data = Uri.parse("package:${context.packageName}")
+            }
+            context.startActivity(intent)
+        }
+    }
+    // ---
+
     fun startDlna(context: Context) {
         if (isStarted) return
         isStarted = true
-        val platform = AndroidDlnaPlatform(context)
+
+        // Check battery status on start
+        checkForBatteryOptimizations()
+
+        val intent = Intent(context, DlnaService::class.java).apply {
+            action = DlnaService.ACTION_START
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+
         val prefs = context.getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
         val savedFolders = prefs.getStringSet("shared_folders", emptySet()) ?: emptySet()
         _sharedFolderIds.value = savedFolders
@@ -176,19 +218,16 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
         myContentProvider.setAllowedFolders(savedFolders)
         this.contentProvider = myContentProvider
 
-        var serverUdn = prefs.getString("server_udn", null) ?: UUID.randomUUID().toString()
-        prefs.edit().putString("server_udn", serverUdn).apply()
-
-        val config = DlnaConfig(
-            enableMediaServer = true,
-            serverName = "Android (${Build.MODEL})",
-            serverUdn = serverUdn,
-            contentProvider = myContentProvider
-        )
-
-        DlnaManager.start(config, platform)
         viewModelScope.launch {
-            DlnaManager.devices.devices.collect { _devices.value = it }
+            while (!DlnaManager.isInitialized()) {
+                delay(200)
+            }
+            launch {
+                DlnaManager.devices.devices.collect { _devices.value = it }
+            }
+            launch {
+                DlnaManager.playback.playbackState.collect { _playbackState.value = it }
+            }
         }
     }
 
@@ -215,6 +254,7 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun connectToRenderer(device: Device) {
+        if (!DlnaManager.isInitialized()) return
         viewModelScope.launch {
             try {
                 DlnaManager.playback.setRenderer(device.deviceId)
@@ -226,6 +266,7 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     fun closeRemote() { _currentScreen.value = Screen.DEVICE_LIST }
 
     fun playResume() {
+        if (!DlnaManager.isInitialized()) return
         val state = playbackState.value.transportState
         val item = playbackState.value.mediaItem
         viewModelScope.launch {
@@ -236,10 +277,25 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun pause() { viewModelScope.launch { try { DlnaManager.playback.pause() } catch(e: Exception) {} } }
-    fun stop() { viewModelScope.launch { try { DlnaManager.playback.stop() } catch(e: Exception) {} } }
-    fun seekTo(seconds: Long) { viewModelScope.launch { try { DlnaManager.playback.seek(seconds.seconds) } catch (e: Exception) {} } }
-    fun setVolume(vol: Int) { viewModelScope.launch { try { DlnaManager.playback.setVolume(vol) } catch(e: Exception) {} } }
+    fun pause() {
+        if (!DlnaManager.isInitialized()) return
+        viewModelScope.launch { try { DlnaManager.playback.pause() } catch(e: Exception) {} }
+    }
+
+    fun stop() {
+        if (!DlnaManager.isInitialized()) return
+        viewModelScope.launch { try { DlnaManager.playback.stop() } catch(e: Exception) {} }
+    }
+
+    fun seekTo(seconds: Long) {
+        if (!DlnaManager.isInitialized()) return
+        viewModelScope.launch { try { DlnaManager.playback.seek(seconds.seconds) } catch (e: Exception) {} }
+    }
+
+    fun setVolume(vol: Int) {
+        if (!DlnaManager.isInitialized()) return
+        viewModelScope.launch { try { DlnaManager.playback.setVolume(vol) } catch(e: Exception) {} }
+    }
 
     fun openBrowser(device: Device) {
         currentDeviceId = device.deviceId
@@ -266,6 +322,8 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun loadContainer(id: String, title: String) {
         val deviceId = currentDeviceId ?: return
+        if (!DlnaManager.isInitialized()) return
+
         _isLoading.value = true
         _currentContainerTitle.value = title
         activeContainerId = id
@@ -281,6 +339,7 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     fun clearSelection() { _selectedMediaItem.value = null }
 
     fun playOnRenderer(renderer: Device, item: MediaItem) {
+        if (!DlnaManager.isInitialized()) return
         viewModelScope.launch {
             try {
                 DlnaManager.playback.setRenderer(renderer.deviceId)
@@ -293,6 +352,6 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
-        DlnaManager.stop()
+        // Intentionally empty to keep service alive
     }
 }

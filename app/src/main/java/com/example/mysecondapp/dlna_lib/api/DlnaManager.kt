@@ -30,6 +30,14 @@ object DlnaManager {
         private set
 
     /**
+     * Checks if the Manager has been started and the engine is running.
+     * Useful for UI components waiting for the Service to initialize the library.
+     */
+    fun isInitialized(): Boolean {
+        return engine != null
+    }
+
+    /**
      * Initializes the DLNA Library.
      * This MUST be called before accessing any other properties.
      */

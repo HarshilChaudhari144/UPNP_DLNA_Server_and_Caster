@@ -236,24 +236,60 @@ fun ServerSettingsScreen(viewModel: DlnaViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Shared Folders") },
+                title = { Text("Server Settings") },
                 navigationIcon = {
                     IconButton(onClick = { viewModel.closeSettings() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
                 }
             )
         }
     ) { padding ->
-        Column(Modifier.padding(padding).padding(16.dp)) {
-            Text("Select folders to make visible on TV:", color = Color.Gray, modifier = Modifier.padding(bottom = 16.dp))
-            LazyColumn {
-                items(allFolders) { folder ->
-                    Row(Modifier.fillMaxWidth().clickable { viewModel.toggleFolderSharing(folder.id) }.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(checked = selectedIds.contains(folder.id), onCheckedChange = { viewModel.toggleFolderSharing(folder.id) })
-                        Spacer(Modifier.width(16.dp))
-                        Text(folder.title, style = MaterialTheme.typography.bodyLarge)
-                    }
-                    Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+        // Use a LazyColumn for the whole screen to accommodate all content
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            // Item 1: The new battery optimization card
+            item {
+                BatteryOptimizationCard(viewModel = viewModel)
+            }
+
+            // Item 2: The shared folders section
+            item {
+                Column {
+                    Text(
+                        "Shared Folders",
+                        style = MaterialTheme.typography.titleLarge,
+                        modifier = Modifier.padding(top = 16.dp)
+                    )
+                    Text(
+                        "Select folders to make visible on your network:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color.Gray,
+                        modifier = Modifier.padding(bottom = 16.dp)
+                    )
                 }
+            }
+
+            // Items 3+: The list of folders
+            items(allFolders) { folder ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable { viewModel.toggleFolderSharing(folder.id) }
+                        .padding(vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = selectedIds.contains(folder.id),
+                        onCheckedChange = { viewModel.toggleFolderSharing(folder.id) }
+                    )
+                    Spacer(Modifier.width(16.dp))
+                    Text(folder.title, style = MaterialTheme.typography.bodyLarge)
+                }
+                Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
             }
         }
     }
@@ -315,4 +351,65 @@ fun formatTime(seconds: Long): String {
     val m = seconds / 60
     val s = seconds % 60
     return String.format("%02d:%02d", m, s)
+}
+
+@Composable
+fun BatteryOptimizationCard(viewModel: DlnaViewModel) {
+    val context = LocalContext.current
+    val isIgnoringOptimizations by viewModel.isIgnoringBatteryOptimizations.collectAsState()
+
+    // This effect re-checks the battery optimization status every time the user
+    // returns to the app, so the card disappears if they grant the permission.
+    val lifecycleOwner = LocalContext.current as androidx.lifecycle.LifecycleOwner
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                viewModel.checkForBatteryOptimizations()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    // Only show the card if the app is being optimized by the system.
+    if (!isIgnoringOptimizations) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 8.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+        ) {
+            Column(Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.BatteryAlert,
+                        contentDescription = "Battery Alert",
+                        tint = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Action Required",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "To ensure the server runs reliably in the background, please disable battery optimizations for this app.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = { viewModel.requestDisableBatteryOptimizations(context) },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Open System Settings")
+                }
+            }
+        }
+    }
 }
