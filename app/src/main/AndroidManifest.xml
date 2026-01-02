@@ -16,13 +16,14 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
 
-    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
-        android:usesPermissionFlags="neverForLocation"
-        tools:targetApi="33" />
+<!--    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"-->
+<!--        android:usesPermissionFlags="neverForLocation"-->
+<!--        tools:targetApi="33" />-->
 
     <!-- Add this permission -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:allowBackup="true"

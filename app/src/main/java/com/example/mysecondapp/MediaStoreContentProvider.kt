@@ -7,22 +7,34 @@ import android.database.Cursor
 import android.net.Uri
 import android.provider.MediaStore
 import com.example.mysecondapp.dlna_lib.api.media.*
-import java.io.FileInputStream
+import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import kotlin.time.Duration.Companion.milliseconds
 
+/**
+ * A hybrid content provider that uses folder paths to filter the MediaStore.
+ * The user selects folders via SAF, which are converted to paths for this provider to use.
+ */
 class MediaStoreContentProvider(private val context: Context) : MediaContentProvider {
 
-    private val allowedFolderIds = mutableSetOf<String>()
+    private val allowedFolderPaths = mutableSetOf<String>()
 
-    fun setAllowedFolders(folderIds: Set<String>) {
-        allowedFolderIds.clear()
-        allowedFolderIds.addAll(folderIds)
+    // This now accepts a set of file paths, not bucket IDs.
+    fun setAllowedFolders(folderPaths: Set<String>) {
+        allowedFolderPaths.clear()
+        allowedFolderPaths.addAll(folderPaths)
     }
 
+    // This now simply converts the saved paths into MediaContainer objects for the UI.
     fun getAllFolders(): List<MediaContainer> {
-        return getFoldersInternal(filterAllowed = false)
-            .filterIsInstance<MediaContainer>()
+        return allowedFolderPaths.map { path ->
+            MediaContainer(
+                id = path, // The ID is the path itself
+                parentId = "0",
+                title = path.substringAfterLast('/')
+            )
+        }
     }
 
     private val collectionUri: Uri = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
@@ -32,123 +44,55 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
     }
 
     override suspend fun getMetadata(mediaId: String): MediaObject? {
-        // 1. Root
+        // 1. Root container
         if (mediaId == "0") {
-            return MediaContainer("0", "-1", "Root", childCount = null, searchable = true)
+            return MediaContainer("0", "-1", "Root", childCount = allowedFolderPaths.size, searchable = true)
         }
 
-        // 2. Folder (Bucket)
-        if (allowedFolderIds.contains(mediaId)) {
-            // We need to fetch the name of the bucket
-            val projection = arrayOf(MediaStore.Files.FileColumns.BUCKET_DISPLAY_NAME)
-            val selection = "${MediaStore.Files.FileColumns.BUCKET_ID} = ?"
-            val args = arrayOf(mediaId)
-
-            try {
-                context.contentResolver.query(collectionUri, projection, selection, args, null)?.use { c ->
-                    if (c.moveToFirst()) {
-                        val name = c.getString(0) ?: "Folder"
-                        return MediaContainer(mediaId, "0", name, searchable = false)
-                    }
-                }
-            } catch (e: Exception) { }
+        // 2. A Folder container (its ID is its path)
+        if (allowedFolderPaths.contains(mediaId)) {
+            return MediaContainer(mediaId, "0", mediaId.substringAfterLast('/'), searchable = true)
         }
 
-        // 3. File
-        // If not a known folder, try to find it as a file
+        // 3. A File (its ID is its MediaStore _ID)
         val projection = arrayOf(
-            MediaStore.Files.FileColumns._ID,
+            MediaStore.Files.FileColumns.DATA, // Need the path to verify it's in an allowed folder
             MediaStore.Files.FileColumns.DISPLAY_NAME,
             MediaStore.Files.FileColumns.MIME_TYPE,
             MediaStore.Files.FileColumns.SIZE,
             MediaStore.Files.FileColumns.DURATION,
             MediaStore.Files.FileColumns.MEDIA_TYPE,
-            MediaStore.Files.FileColumns.BUCKET_ID,
-            MediaStore.Files.FileColumns.DATE_ADDED, // <--- ADD THIS
-            MediaStore.Files.FileColumns.WIDTH,  // <--- NEW
-            MediaStore.Files.FileColumns.HEIGHT  // <--- NEW
+            MediaStore.Files.FileColumns.DATE_ADDED,
+            MediaStore.Files.FileColumns.WIDTH,
+            MediaStore.Files.FileColumns.HEIGHT
         )
         val selection = "${MediaStore.Files.FileColumns._ID} = ?"
-
         try {
             context.contentResolver.query(collectionUri, projection, selection, arrayOf(mediaId), null)?.use { c ->
                 if (c.moveToFirst()) {
-                    val bucketId = c.getString(c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.BUCKET_ID))
-                    // Only return metadata if the parent folder is allowed
-                    if (allowedFolderIds.contains(bucketId)) {
-                        return mapCursorToMediaItem(c, bucketId)
+                    val path = c.getString(c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATA))
+                    val parentPath = File(path).parent
+                    // Check if the file's parent path is one of the allowed folders
+                    if (parentPath != null && allowedFolderPaths.any { path.startsWith(it) }) {
+                        return mapCursorToMediaItem(c, parentPath)
                     }
                 }
             }
-        } catch (e: Exception) { }
-
+        } catch (e: Exception) { /* Ignore */ }
         return null
     }
 
     override suspend fun list(containerId: String): List<MediaObject> {
         return if (containerId == "0") {
-            getFoldersInternal(filterAllowed = true)
+            // Return the list of top-level shared folders
+            getAllFolders()
         } else {
-            if (allowedFolderIds.contains(containerId)) {
-                getFiles(containerId)
-            } else {
-                emptyList()
-            }
+            // Assume the containerId is a folder path and list files inside it
+            getFilesForPath(containerId)
         }
     }
 
-    private fun getFoldersInternal(filterAllowed: Boolean): List<MediaObject> {
-        val folders = mutableMapOf<String, String>()
-        // Map<BucketID, Pair<DisplayName, Count>>
-        val folderMap = mutableMapOf<String, Pair<String, Int>>()
-        val projection = arrayOf(
-            MediaStore.Files.FileColumns.BUCKET_ID,
-            MediaStore.Files.FileColumns.BUCKET_DISPLAY_NAME
-        )
-        val selection = "${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?, ?)"
-        val selectionArgs = arrayOf(
-            MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(),
-            MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO.toString(),
-            MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString()
-        )
-
-        try {
-            context.contentResolver.query(collectionUri, projection, selection, selectionArgs, null)?.use { cursor ->
-                val idCol = cursor.getColumnIndex(MediaStore.Files.FileColumns.BUCKET_ID)
-                val nameCol = cursor.getColumnIndex(MediaStore.Files.FileColumns.BUCKET_DISPLAY_NAME)
-                while (cursor.moveToNext()) {
-                    if (idCol != -1 && nameCol != -1) {
-                        val id = cursor.getString(idCol)
-                        val name = cursor.getString(nameCol)
-                        if (id != null && name != null) {
-                            // FIX: Logic to increment count for this bucket
-                            val current = folderMap[id]
-                            if (current == null) {
-                                folderMap[id] = name to 1
-                            } else {
-                                folderMap[id] = name to (current.second + 1)
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) { e.printStackTrace() }
-
-        return folderMap.map { (id, info) ->
-            val (name, count) = info
-            MediaContainer(
-                id = id,
-                parentId = "0",
-                title = name,
-                childCount = count, // FIX: Pass the calculated count here
-                searchable = true
-            )
-        }
-            .filter { !filterAllowed || allowedFolderIds.contains(it.id) }
-            .sortedBy { it.title }
-    }
-
-    private fun getFiles(bucketId: String): List<MediaObject> {
+    private fun getFilesForPath(folderPath: String): List<MediaObject> {
         val items = mutableListOf<MediaItem>()
         val projection = arrayOf(
             MediaStore.Files.FileColumns._ID,
@@ -157,17 +101,23 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
             MediaStore.Files.FileColumns.SIZE,
             MediaStore.Files.FileColumns.DURATION,
             MediaStore.Files.FileColumns.MEDIA_TYPE,
-            MediaStore.Files.FileColumns.DATE_ADDED, // <--- ADD THIS
-            MediaStore.Files.FileColumns.WIDTH,  // <--- NEW
-            MediaStore.Files.FileColumns.HEIGHT  // <--- NEW
+            MediaStore.Files.FileColumns.DATE_ADDED,
+            MediaStore.Files.FileColumns.WIDTH,
+            MediaStore.Files.FileColumns.HEIGHT,
+            MediaStore.Files.FileColumns.DATA // Important for filtering
         )
-        val selection = "${MediaStore.Files.FileColumns.BUCKET_ID} = ? AND ${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?, ?)"
-        val selectionArgs = arrayOf(bucketId, MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(), MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO.toString(), MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString())
+        // CRITICAL CHANGE: Query by path, not bucket ID
+        val selection = "${MediaStore.Files.FileColumns.DATA} LIKE ? AND ${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?, ?)"
+        val selectionArgs = arrayOf("$folderPath/%", MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(), MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO.toString(), MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString())
 
         try {
             context.contentResolver.query(collectionUri, projection, selection, selectionArgs, "${MediaStore.Files.FileColumns.DISPLAY_NAME} ASC")?.use { cursor ->
                 while (cursor.moveToNext()) {
-                    items.add(mapCursorToMediaItem(cursor, bucketId))
+                    // Additional check to prevent files from sub-sub-folders appearing
+                    val filePath = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATA))
+                    if (File(filePath).parent == folderPath) {
+                        items.add(mapCursorToMediaItem(cursor, folderPath))
+                    }
                 }
             }
         } catch (e: Exception) { e.printStackTrace() }
@@ -176,32 +126,17 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
 
     private fun mapCursorToMediaItem(cursor: Cursor, parentId: String): MediaItem {
         val id = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID))
-//        val title = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)) ?: "Unknown"
-        // FIX: Get raw name and strip extension
         val rawTitle = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)) ?: "Unknown"
-        val title = rawTitle.substringBeforeLast('.') // "Movie.mkv" -> "Movie"
+        val title = rawTitle.substringBeforeLast('.')
         val mimeType = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MIME_TYPE)) ?: "application/octet-stream"
         val size = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE))
-        val durationIndex = cursor.getColumnIndex(MediaStore.Files.FileColumns.DURATION)
-        val duration = if (durationIndex != -1 && !cursor.isNull(durationIndex)) cursor.getLong(durationIndex).milliseconds else null
-        // FIX: Extract Date
-        // Android returns Seconds, Java Date needs Milliseconds
-        val dateIndex = cursor.getColumnIndex(MediaStore.Files.FileColumns.DATE_ADDED)
-        val date = if (dateIndex != -1 && !cursor.isNull(dateIndex)) {
-            cursor.getLong(dateIndex) * 1000L
-        } else null
-        // FIX: Extract Resolution
-        val wIndex = cursor.getColumnIndex(MediaStore.Files.FileColumns.WIDTH)
-        val hIndex = cursor.getColumnIndex(MediaStore.Files.FileColumns.HEIGHT)
-        val resolution = if (wIndex != -1 && hIndex != -1) {
-            val w = cursor.getInt(wIndex)
-            val h = cursor.getInt(hIndex)
-            if (w > 0 && h > 0) "${w}x${h}" else null
-        } else null
-
+        val duration = getLongOrNull(cursor, MediaStore.Files.FileColumns.DURATION)?.milliseconds
+        val date = getLongOrNull(cursor, MediaStore.Files.FileColumns.DATE_ADDED)?.let { it * 1000L }
+        val width = getIntOrNull(cursor, MediaStore.Files.FileColumns.WIDTH)
+        val height = getIntOrNull(cursor, MediaStore.Files.FileColumns.HEIGHT)
+        val resolution = if (width != null && height != null && width > 0) "${width}x${height}" else null
 
         val mediaTypeInt = cursor.getInt(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MEDIA_TYPE))
-
         val (mediaType, upnpClass) = when (mediaTypeInt) {
             MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE -> MediaType.IMAGE to "object.item.imageItem"
             MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO -> MediaType.AUDIO to "object.item.audioItem"
@@ -209,37 +144,37 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
             else -> MediaType.UNKNOWN to "object.item"
         }
 
-        val protocolInfo = "http-get:*:$mimeType:*"
+        // CRITICAL FIX: The resource URI must be a relative path using the MediaStore ID
+        val resourceUri = "/content/$id"
+
         val resource = MediaResource(
-            uri = "",
-            protocolInfo = protocolInfo,
+            uri = resourceUri,
+            protocolInfo = "http-get:*:$mimeType:*",
             mimeType = mimeType,
             size = size,
             duration = duration,
-            resolution = resolution // <--- Pass it here
+            resolution = resolution
         )
 
         return MediaItem(id = id, parentId = parentId, title = title, upnpClass = upnpClass, mediaType = mediaType, resources = listOf(resource), date = date)
     }
 
+    // Helper functions to safely get values from cursor
+    private fun getLongOrNull(cursor: Cursor, columnName: String): Long? {
+        val index = cursor.getColumnIndex(columnName)
+        return if (index != -1 && !cursor.isNull(index)) cursor.getLong(index) else null
+    }
+
+    private fun getIntOrNull(cursor: Cursor, columnName: String): Int? {
+        val index = cursor.getColumnIndex(columnName)
+        return if (index != -1 && !cursor.isNull(index)) cursor.getInt(index) else null
+    }
+
     override fun openMedia(mediaId: String): MediaDataSource {
         val idLong = mediaId.toLongOrNull() ?: throw IllegalArgumentException("Invalid Media ID")
         val contentUri = ContentUris.withAppendedId(collectionUri, idLong)
-
-        // FIX: Get accurate size/mime from content resolver
-        var mime = context.contentResolver.getType(contentUri) ?: "application/octet-stream"
-
-        // Use AssetFileDescriptor to get EXACT size
-        var size = 0L
-        try {
-            val afd = context.contentResolver.openAssetFileDescriptor(contentUri, "r")
-            size = afd?.length ?: 0L
-            afd?.close()
-        } catch (e: Exception) {
-            // Fallback to basic query if AFD fails
-            e.printStackTrace()
-        }
-
+        val size = context.contentResolver.openAssetFileDescriptor(contentUri, "r")?.use { it.length } ?: 0
+        val mime = context.contentResolver.getType(contentUri) ?: "application/octet-stream"
         return MediaStoreDataSource(context, contentUri, size, mime)
     }
 
@@ -249,28 +184,18 @@ class MediaStoreContentProvider(private val context: Context) : MediaContentProv
         override val size: Long,
         override val contentType: String
     ) : MediaDataSource {
-
         override fun openFull(): InputStream {
-            // Use openRange(0, null) to reuse the AFD logic
-            return openRange(0, null)
+            return context.contentResolver.openInputStream(uri) ?: throw IOException("Could not open stream for $uri")
         }
 
         override fun openRange(start: Long, length: Long?): InputStream {
-            try {
-                // FIX: Use AssetFileDescriptor for robust seeking
-                val afd: AssetFileDescriptor = context.contentResolver.openAssetFileDescriptor(uri, "r")
-                    ?: throw java.io.IOException("Cannot open AFD for $uri")
-
-                val fis = afd.createInputStream() // Auto-closes AFD when this stream closes
-
-                if (start > 0) {
-                    fis.skip(start)
-                }
-
-                return fis
-            } catch (e: Exception) {
-                throw java.io.IOException(e)
+            val afd = context.contentResolver.openAssetFileDescriptor(uri, "r")
+                ?: throw IOException("Cannot open AFD for $uri")
+            val fis = afd.createInputStream()
+            if (start > 0) {
+                fis.skip(start)
             }
+            return fis
         }
     }
 }

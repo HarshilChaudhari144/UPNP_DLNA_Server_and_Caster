@@ -1,5 +1,6 @@
 package com.example.mysecondapp
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -25,6 +26,13 @@ import androidx.compose.ui.unit.sp
 import com.example.mysecondapp.dlna_lib.api.device.Device
 import com.example.mysecondapp.dlna_lib.api.media.MediaItem
 import com.example.mysecondapp.dlna_lib.api.playback.TransportState
+// Add these imports to the top of the file
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.documentfile.provider.DocumentFile
+// Add these imports if they are missing
+import java.io.File
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -241,11 +249,21 @@ fun RemoteControlScreen(viewModel: DlnaViewModel) {
     }
 }
 
+// Replace the existing ServerSettingsScreen with this new one
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ServerSettingsScreen(viewModel: DlnaViewModel) {
-    val allFolders by viewModel.allLocalFolders.collectAsState()
-    val selectedIds by viewModel.sharedFolderIds.collectAsState()
+    // FIX 1: Use the correct property name `sharedFolderPaths`
+    val sharedFolderPaths by viewModel.sharedFolderPaths.collectAsState()
+
+    val folderPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree(),
+        onResult = { uri ->
+            if (uri != null) {
+                viewModel.addSharedFolder(uri)
+            }
+        }
+    )
 
     BackHandler { viewModel.closeSettings() }
 
@@ -257,9 +275,15 @@ fun ServerSettingsScreen(viewModel: DlnaViewModel) {
                     IconButton(onClick = { viewModel.closeSettings() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
                 }
             )
+        },
+        floatingActionButton = {
+            ExtendedFloatingActionButton(
+                onClick = { folderPickerLauncher.launch(null) },
+                icon = { Icon(Icons.Default.Add, "Add Folder") },
+                text = { Text("Add Folder") }
+            )
         }
     ) { padding ->
-        // Use a LazyColumn for the whole screen to accommodate all content
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -267,12 +291,10 @@ fun ServerSettingsScreen(viewModel: DlnaViewModel) {
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Item 1: The new battery optimization card
             item {
                 BatteryOptimizationCard(viewModel = viewModel)
             }
 
-            // Item 2: The shared folders section
             item {
                 Column {
                     Text(
@@ -281,34 +303,49 @@ fun ServerSettingsScreen(viewModel: DlnaViewModel) {
                         modifier = Modifier.padding(top = 16.dp)
                     )
                     Text(
-                        "Select folders to make visible on your network:",
+                        "Add or remove folders to make their content visible on your network.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color.Gray,
-                        modifier = Modifier.padding(bottom = 16.dp)
                     )
                 }
             }
 
-            // Items 3+: The list of folders
-            items(allFolders) { folder ->
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .clickable { viewModel.toggleFolderSharing(folder.id) }
-                        .padding(vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Checkbox(
-                        checked = selectedIds.contains(folder.id),
-                        onCheckedChange = { viewModel.toggleFolderSharing(folder.id) }
+            if (sharedFolderPaths.isEmpty()) {
+                item {
+                    Text(
+                        "No folders are currently shared. Tap 'Add Folder' to begin.",
+                        modifier = Modifier.padding(vertical = 24.dp),
+                        textAlign = TextAlign.Center,
+                        color = Color.Gray
                     )
-                    Spacer(Modifier.width(16.dp))
-                    Text(folder.title, style = MaterialTheme.typography.bodyLarge)
                 }
-                Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            }
+
+            // FIX 2: Iterate over the correct list of path strings
+            items(sharedFolderPaths.toList()) { pathString ->
+                val displayName = getDisplayNameFromPath(pathString)
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    ListItem(
+                        headlineContent = { Text(displayName, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        // FIX 3: Both `displayName` and `pathString` are now correctly typed as String
+                        supportingContent = { Text(pathString, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 12.sp) },
+                        leadingContent = { Icon(Icons.Default.Folder, null) },
+                        trailingContent = {
+                            IconButton(onClick = { viewModel.removeSharedFolder(pathString) }) {
+                                Icon(Icons.Default.Delete, "Remove Folder", tint = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    )
+                }
             }
         }
     }
+}
+
+// Add this new, simpler helper function at the bottom of the file
+// (You can delete the old getDisplayNameFromUri function)
+private fun getDisplayNameFromPath(path: String): String {
+    return path.substringAfterLast('/')
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
