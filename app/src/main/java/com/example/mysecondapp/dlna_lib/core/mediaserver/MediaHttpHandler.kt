@@ -7,6 +7,8 @@ import com.example.mysecondapp.dlna_lib.platform.HttpHandler
 import com.example.mysecondapp.dlna_lib.platform.HttpMethod
 import com.example.mysecondapp.dlna_lib.platform.HttpRequest
 import com.example.mysecondapp.dlna_lib.platform.HttpResponse
+import java.io.File
+import java.net.URLDecoder
 
 internal class MediaHttpHandler(
     private val contentProvider: MediaContentProvider,
@@ -23,7 +25,8 @@ internal class MediaHttpHandler(
             return HttpResponse(405)
         }
 
-        val path = request.path
+        // We need to decode the path here because it may contain URL-encoded segments like %20 for spaces.
+        val path = URLDecoder.decode(request.path, "UTF-8")
         return when {
             path.startsWith("/content/") -> handleContent(request, path.substringAfter("/content/"))
             path.startsWith("/thumb/") -> handleThumbnail(request, path.substringAfter("/thumb/"))
@@ -32,7 +35,25 @@ internal class MediaHttpHandler(
     }
 
     private fun handleContent(request: HttpRequest, pathRaw: String): HttpResponse {
-        val mediaId = pathRaw.split("/").first()
+        // --- FIX: Robustly parse the file path from the raw URL path. ---
+        // 1. Reconstruct the potential absolute path. We prepend "/" because our
+        //    FileSystemContentProvider removed it before encoding.
+        val potentialPath = "/$pathRaw"
+
+        // 2. Find the actual file path by stripping potential suffixes added by renderers.
+        //    For example, if the path is "/path/to/file.mkv/title", this loop will find "/path/to/file.mkv".
+        var file = File(potentialPath)
+        while (file.path != "/" && !file.isFile) {
+            file = file.parentFile ?: break // Go up one level
+        }
+
+        // 3. Check if we found a valid file.
+        if (!file.isFile) {
+            DlnaLogger.e(tag, "Error serving media : File not found or is not a regular file: $potentialPath")
+            return HttpResponse(404, body = "File not found: $potentialPath")
+        }
+        val mediaId = file.absolutePath
+        // --- End of FIX ---
 
         try {
             val dataSource = contentProvider.openMedia(mediaId)

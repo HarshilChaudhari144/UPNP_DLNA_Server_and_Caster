@@ -32,6 +32,7 @@ import com.example.mysecondapp.dlna_lib.api.DlnaManager
 import com.example.mysecondapp.dlna_lib.api.browse.BrowseResult
 import com.example.mysecondapp.dlna_lib.api.device.Device
 import com.example.mysecondapp.dlna_lib.api.media.MediaContainer
+import com.example.mysecondapp.dlna_lib.api.media.MediaContentProvider
 import com.example.mysecondapp.dlna_lib.api.media.MediaItem
 import com.example.mysecondapp.dlna_lib.api.playback.PlaybackState
 import com.example.mysecondapp.dlna_lib.api.playback.TransportState
@@ -43,6 +44,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.UUID
 import kotlin.time.Duration.Companion.seconds
 
@@ -160,7 +162,6 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     private val _selectedMediaItem = MutableStateFlow<MediaItem?>(null)
     val selectedMediaItem: StateFlow<MediaItem?> = _selectedMediaItem.asStateFlow()
 
-    // RENAMED: This now holds simple file path strings
     private val _sharedFolderPaths = MutableStateFlow<Set<String>>(emptySet())
     val sharedFolderPaths: StateFlow<Set<String>> = _sharedFolderPaths.asStateFlow()
 
@@ -170,7 +171,8 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     val isServerRunning: StateFlow<Boolean> = DlnaService.isRunning
     private var dataCollectorJob: Job? = null
 
-    private var contentProvider: MediaStoreContentProvider? = null
+    // --- CHANGE: Use the interface type to support any provider ---
+    private var contentProvider: MediaContentProvider? = null
     private var currentDeviceId: String? = null
     private var activeContainerId: String = "0"
     private val historyStack = mutableListOf<Pair<String, String>>()
@@ -202,19 +204,27 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
         checkForBatteryOptimizations()
 
         val prefs = context.getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
-        var savedFolders = prefs.getStringSet("shared_folders", emptySet()) ?: emptySet()
-
-        // --- DATA MIGRATION ---
-        // If any saved folder is NOT a valid path (i.e., it's an old numeric ID), clear everything.
-        if (savedFolders.any { !it.startsWith("/") }) {
-            savedFolders = emptySet()
-            prefs.edit().putStringSet("shared_folders", savedFolders).apply()
-        }
+        val savedFolders = prefs.getStringSet("shared_folders", emptySet()) ?: emptySet()
 
         _sharedFolderPaths.value = savedFolders
+        restartDlnaManager()
+    }
 
-        val myContentProvider = MediaStoreContentProvider(context)
-        myContentProvider.setAllowedFolders(savedFolders)
+    // --- NEW: Centralized function to start/restart the DLNA engine with current settings ---
+    private fun restartDlnaManager() {
+        // Stop any existing engine first.
+        if (DlnaManager.isInitialized()) {
+            DlnaManager.stopClientEngine()
+        }
+
+        val context = getApplication<Application>().applicationContext
+        val prefs = context.getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
+
+        // Convert the saved path strings to a set of File objects.
+        val rootFiles = _sharedFolderPaths.value.map { File(it) }.toSet()
+
+        // --- CHANGE: Use the new FileSystemContentProvider ---
+        val myContentProvider = FileSystemContentProvider(rootFiles)
         this.contentProvider = myContentProvider
 
         val config = DlnaConfig(
@@ -223,12 +233,12 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
             serverUdn = prefs.getString("server_udn", null) ?: UUID.randomUUID().toString().also {
                 prefs.edit().putString("server_udn", it).apply()
             },
-            contentProvider = myContentProvider
+            contentProvider = myContentProvider // Pass the new provider
         )
         val platform = AndroidDlnaPlatform(context)
 
         DlnaManager.startClientEngine(config, platform)
-        startDataCollectors()
+        startDataCollectors() // Re-subscribe to data flows from the new engine instance
     }
 
     private fun startDataCollectors() {
@@ -258,39 +268,41 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
         context.startService(intent)
     }
 
-    // --- New SAF Path Management Functions ---
     fun addSharedFolder(uri: Uri) {
         val path = uriToPath(uri) ?: return // Convert URI to a usable file path
 
         val currentPaths = _sharedFolderPaths.value.toMutableSet()
-        currentPaths.add(path)
-        _sharedFolderPaths.value = currentPaths
+        if (currentPaths.add(path)) {
+            _sharedFolderPaths.value = currentPaths
 
-        contentProvider?.setAllowedFolders(currentPaths)
-        getApplication<Application>().applicationContext
-            .getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
-            .edit().putStringSet("shared_folders", currentPaths).apply()
+            getApplication<Application>().applicationContext
+                .getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
+                .edit().putStringSet("shared_folders", currentPaths).apply()
+
+            // --- CHANGE: Restart the engine to apply the new folder ---
+            restartDlnaManager()
+        }
     }
 
     fun removeSharedFolder(path: String) {
         val currentPaths = _sharedFolderPaths.value.toMutableSet()
-        currentPaths.remove(path)
-        _sharedFolderPaths.value = currentPaths
+        if (currentPaths.remove(path)) {
+            _sharedFolderPaths.value = currentPaths
 
-        contentProvider?.setAllowedFolders(currentPaths)
-        getApplication<Application>().applicationContext
-            .getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
-            .edit().putStringSet("shared_folders", currentPaths).apply()
+            getApplication<Application>().applicationContext
+                .getSharedPreferences("dlna_prefs", Context.MODE_PRIVATE)
+                .edit().putStringSet("shared_folders", currentPaths).apply()
+
+            // --- CHANGE: Restart the engine to apply the removal ---
+            restartDlnaManager()
+        }
     }
 
-    /**
-     * Converts a SAF tree URI into an absolute file path.
-     */
     private fun uriToPath(uri: Uri): String? {
         if (uri.authority != "com.android.externalstorage.documents") {
-            return null // We can only handle standard external storage URIs
+            return null
         }
-        val docId = uri.pathSegments.last() // e.g., "primary:Movies" or "1234-5678:MyFolder"
+        val docId = uri.pathSegments.last()
         val split = docId.split(":")
         val type = split.getOrNull(0)
         val path = split.getOrNull(1)
@@ -300,20 +312,15 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
                 val root = Environment.getExternalStorageDirectory().absolutePath
                 if (path != null) "$root/$path" else root
             }
-            // You could add logic here to handle SD cards, which have UUIDs as the type
             else -> null
         }
     }
-    // ------------------------------------------
 
     fun openSettings() {
-        // Now that the folder list is dynamic, we don't need to pre-load anything.
         _currentScreen.value = Screen.SERVER_SETTINGS
     }
 
     fun closeSettings() { _currentScreen.value = Screen.DEVICE_LIST }
-
-    // --- All other functions (connectToRenderer, browse, etc.) remain unchanged ---
 
     fun connectToRenderer(device: Device) {
         if (!DlnaManager.isInitialized()) return

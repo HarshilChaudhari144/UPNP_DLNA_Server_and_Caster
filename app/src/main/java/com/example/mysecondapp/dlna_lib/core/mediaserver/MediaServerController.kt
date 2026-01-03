@@ -436,22 +436,23 @@ internal class MediaServerController(
                 val resAttr = if (resource?.resolution != null) " resolution=\"${resource.resolution}\"" else ""
 
                 // FIX: Trust existing extension if present, otherwise append based on mime
-                val safeTitle = obj.title.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
-                val finalName = if (safeTitle.contains(".")) {
-                    // Title already has an extension (e.g., "Movie.mkv")
-                    safeTitle
-                } else {
-                    // Append extension based on mime type
-                    val ext = when {
-                        mime.startsWith("video") -> ".mp4" // Safest fallback for video
-                        mime.startsWith("audio") -> ".mp3"
-                        mime.startsWith("image") -> ".jpg"
-                        else -> "" // No extension
-                    }
-                    "$safeTitle$ext"
-                }
+//                val safeTitle = obj.title.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
+//                val finalName = if (safeTitle.contains(".")) {
+//                    // Title already has an extension (e.g., "Movie.mkv")
+//                    safeTitle
+//                } else {
+//                    // Append extension based on mime type
+//                    val ext = when {
+//                        mime.startsWith("video") -> ".mp4" // Safest fallback for video
+//                        mime.startsWith("audio") -> ".mp3"
+//                        mime.startsWith("image") -> ".jpg"
+//                        else -> "" // No extension
+//                    }
+//                    "$safeTitle$ext"
+//                }
 
-                val url = "$baseUrl/content/$id/$finalName"
+//                val url = "$baseUrl/content/$id/$finalName"
+                val url = "$baseUrl${resource?.uri}"
 
                 sb.append("""<item id="$id" parentID="$parent" restricted="1">""")
                 sb.append("<dc:title>$title</dc:title>")
