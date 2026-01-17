@@ -353,15 +353,73 @@ private fun getDisplayNameFromPath(path: String): String {
 fun PlayOptionsSheet(mediaItem: MediaItem, viewModel: DlnaViewModel, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val devices by viewModel.devices.collectAsState()
-    val renderers = remember(devices) { devices.filter { it.services.any { s -> s.serviceType.contains("AVTransport") } } }
+    val manualSubPath by viewModel.manualSubtitlePath.collectAsState()
+
+    val renderers = remember(devices) {
+        devices.filter { it.services.any { s -> s.serviceType.contains("AVTransport") } }
+    }
     var showRendererList by remember { mutableStateOf(false) }
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    // Launcher for manual subtitle selection
+    val subPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri ->
+            if (uri != null) {
+                viewModel.setManualSubtitle(uri)
+            }
+        }
+    )
+
+    ModalBottomSheet(onDismissRequest = {
+        viewModel.clearManualSubtitle()
+        onDismiss()
+    }) {
         Column(Modifier.padding(16.dp).fillMaxWidth()) {
             Text(mediaItem.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.height(16.dp))
+
+            // Subtitle Selection UI
+            Card(
+                modifier = Modifier.padding(vertical = 8.dp).fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Subtitles, null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = if (manualSubPath != null) "Manual Subtitle Attached" else "No manual subtitle",
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                        if (manualSubPath != null) {
+                            Text(
+                                text = manualSubPath!!.substringAfterLast('/'),
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    if (manualSubPath != null) {
+                        IconButton(onClick = { viewModel.clearManualSubtitle() }) {
+                            Icon(Icons.Default.Clear, "Clear", tint = MaterialTheme.colorScheme.error)
+                        }
+                    } else {
+                        TextButton(onClick = {
+                            subPickerLauncher.launch(arrayOf("application/x-subrip", "text/plain", "*/*"))
+                        }) {
+                            Text("Select File")
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
 
             if (!showRendererList) {
+                // ... (Existing "Play Locally" ListItem remains unchanged) ...
                 ListItem(
                     headlineContent = { Text("Play Locally") },
                     leadingContent = { Icon(Icons.Default.PhoneAndroid, null) },
@@ -375,12 +433,14 @@ fun PlayOptionsSheet(mediaItem: MediaItem, viewModel: DlnaViewModel, onDismiss: 
                         onDismiss()
                     }
                 )
+
                 ListItem(
                     headlineContent = { Text("Cast to Device") },
                     leadingContent = { Icon(Icons.Default.Cast, null) },
                     modifier = Modifier.clickable { showRendererList = true }
                 )
             } else {
+                // ... (Existing Renderer List code remains unchanged) ...
                 Text("Select Device", style = MaterialTheme.typography.titleMedium)
                 LazyColumn(Modifier.fillMaxHeight(0.5f)) {
                     items(renderers) { device ->

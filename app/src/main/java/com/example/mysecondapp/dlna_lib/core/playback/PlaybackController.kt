@@ -409,29 +409,50 @@ internal class PlaybackController(
         }
     }
 
-    // FIX: Completely rewritten to generate valid escaped XML
+    // PHASE 2: Updated to handle multiple resources and Samsung specific tags
     private fun buildDidlMetadata(item: MediaItem): String {
         val title = escapeXml(item.title)
         val id = escapeXml(item.id)
         val parent = escapeXml(item.parentId)
         val upnpClass = item.upnpClass
-        val rawProtocol = item.resources.firstOrNull()?.protocolInfo ?: "*:*:*:*"
-        val protocolInfo = patchProtocolInfo(rawProtocol)
-        val uri = item.resources.firstOrNull()?.uri ?: ""
 
-        // 1. Build the Inner XML (Clean)
-        val innerXml = """
-<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <item id="$id" parentID="$parent" restricted="1">
-        <dc:title>$title</dc:title>
-        <upnp:class>$upnpClass</upnp:class>
-        <res protocolInfo="$protocolInfo">$uri</res>
-    </item>
-</DIDL-Lite>
-        """.trim()
+        val sb = StringBuilder()
+        sb.append("<DIDL-Lite ")
+        sb.append("xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" ")
+        sb.append("xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" ")
+        sb.append("xmlns:dc=\"http://purl.org/dc/elements/1.1/\" ")
+        sb.append("xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\" ")
+        sb.append("xmlns:sec=\"http://www.sec.co.kr/dlna\">")
 
-        // 2. Escape it for the SOAP XML envelope (Client-side)
-        return escapeXml(innerXml)
+        sb.append("<item id=\"$id\" parentID=\"$parent\" restricted=\"1\">")
+        sb.append("<dc:title>$title</dc:title>")
+        sb.append("<upnp:class>$upnpClass</upnp:class>")
+
+        // 1. Process all resources
+        item.resources.forEachIndexed { index, res ->
+            val protocolInfo = if (index == 0) patchProtocolInfo(res.protocolInfo) else res.protocolInfo
+            val uri = escapeXml(res.uri)
+            sb.append("<res protocolInfo=\"$protocolInfo\">$uri</res>")
+        }
+
+        // 2. Add Samsung specific subtitle tag if subtitles are present
+        item.resources.forEach { res ->
+            val type = when (res.mimeType) {
+                "text/srt" -> "srt"
+                "text/vtt" -> "vtt"
+                "application/x-sami" -> "smi"
+                else -> null
+            }
+            if (type != null) {
+                val uri = escapeXml(res.uri)
+                sb.append("<sec:CaptionInfoEx sec:type=\"$type\">$uri</sec:CaptionInfoEx>")
+            }
+        }
+
+        sb.append("</item></DIDL-Lite>")
+
+        // Escape the final XML for the SOAP envelope
+        return escapeXml(sb.toString())
     }
 
     private fun patchProtocolInfo(info: String): String {

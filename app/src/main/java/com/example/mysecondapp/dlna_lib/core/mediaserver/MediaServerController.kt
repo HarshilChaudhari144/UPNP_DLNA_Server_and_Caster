@@ -5,7 +5,7 @@ import com.example.mysecondapp.dlna_lib.api.DlnaConfig
 import com.example.mysecondapp.dlna_lib.api.media.*
 import com.example.mysecondapp.dlna_lib.core.lifecycle.dlnaScope
 import com.example.mysecondapp.dlna_lib.core.logging.DlnaLogger
-import com.example.mysecondapp.dlna_lib.core.ssdp.SsdpController // NEW IMPORT
+import com.example.mysecondapp.dlna_lib.core.ssdp.SsdpController
 import com.example.mysecondapp.dlna_lib.platform.*
 import kotlinx.coroutines.*
 import java.util.UUID
@@ -20,7 +20,7 @@ internal class MediaServerController(
     private val mimeResolver: MimeTypeResolver,
     private val networkInfo: NetworkInfoProvider,
     private val ssdpTransport: SsdpTransport,
-    private val ssdpController: SsdpController // <--- ADDED THIS
+    private val ssdpController: SsdpController
 ) {
     private val tag = "MediaServerController"
 
@@ -54,7 +54,7 @@ internal class MediaServerController(
             // 2. FIX: Register with SSDP Controller so it can respond to M-SEARCH requests
             val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
             val location = "http://$ip:$boundPort/description.xml"
-            ssdpController.setServerInfo(serverUuid, location) // <--- ADDED THIS
+            ssdpController.setServerInfo(serverUuid, location)
 
             // 3. Start SSDP Advertising Loop (for NOTIFY messages)
             startAdvertising()
@@ -337,6 +337,11 @@ internal class MediaServerController(
     private suspend fun handleBrowse(request: HttpRequest): HttpResponse {
         val body = request.body ?: return HttpResponse(400)
 
+        // LOG 1: Capture User-Agent and full SOAP Body
+        val userAgent = request.headers.entries.find { it.key.equals("User-Agent", ignoreCase = true) }?.value ?: "Unknown"
+        android.util.Log.i(tag, ">>> BROWSE REQUEST from $userAgent")
+        logLargeXml(tag, "SOAP Body", body)
+
         val args = parseSoapBody(body)
         val objectId = args["ObjectID"] ?: "0"
         val browseFlag = args["BrowseFlag"] ?: "BrowseDirectChildren" // Extract Flag
@@ -364,6 +369,9 @@ internal class MediaServerController(
             } else {
                 list.drop(startIndex).take(count)
             }
+
+            // LOG 2: Capture the arguments the TV specifically requested
+            android.util.Log.i(tag, "Extracted Args: ObjectID=$objectId, Filter=${args["Filter"]}, Count=${args["RequestedCount"]}")
 
             val didlXml = generateDidl(slicedList)
             val numberReturned = slicedList.size
@@ -396,14 +404,21 @@ internal class MediaServerController(
         return HttpResponse(200, mimeType = "text/xml", body = wrapSoap(body))
     }
 
-    // --- 4. DIDL GENERATION (FIXED URL LOGIC) ---
-
+    // PHASE 2: Updated to handle multiple resources and Samsung specific tags
+    // --- UPDATED generateDidl for Subtitle Visibility during Browsing ---
     private fun generateDidl(items: List<MediaObject>): String {
         val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
         val baseUrl = "http://$ip:$boundPort"
 
         val sb = StringBuilder()
-        sb.append("""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">""")
+        sb.append("<DIDL-Lite ")
+        sb.append("xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" ")
+        sb.append("xmlns:dc=\"http://purl.org/dc/elements/1.1/\" ")
+        sb.append("xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" ")
+        sb.append("xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\" ")
+        // Enforce namespaces required for Samsung and generic subtitle discovery
+        sb.append("xmlns:sec=\"http://www.sec.co.kr/dlna\" ")
+        sb.append("xmlns:pv=\"http://www.pv.com/pvns/\">")
 
         items.forEach { obj ->
             val id = escapeXml(obj.id)
@@ -415,59 +430,71 @@ internal class MediaServerController(
                 val childCountAttr = if (obj.childCount != null) " childCount=\"${obj.childCount}\"" else ""
                 // FIX: Write searchable flag (static 0 or 1 based on obj.searchable)
                 val isSearchable = if (obj.searchable) "1" else "0"
-                sb.append("""<container id="$id" parentID="$parent" restricted="1" searchable="$isSearchable"$childCountAttr>""")
+                sb.append("<container id=\"$id\" parentID=\"$parent\" restricted=\"1\" searchable=\"$isSearchable\"$childCountAttr>")
                 sb.append("<dc:title>$title</dc:title>")
                 // FIX: Use standard storageFolder class
                 sb.append("<upnp:class>object.container.storageFolder</upnp:class>")
                 sb.append("</container>")
             } else if (obj is MediaItem) {
                 val upnpClass = obj.upnpClass
-                val resource = obj.resources.firstOrNull()
-                val mime = resource?.mimeType ?: "application/octet-stream"
-                // 1. FORMAT SIZE & DURATION
-                // The TV needs these attributes inside the <res> tag to show info
-                val sizeAttr = if (resource?.size != null && resource.size > 0) " size=\"${resource.size}\"" else ""
-
-                val durationAttr = if (resource?.duration != null) {
-                    val durStr = formatDuration(resource.duration.inWholeMilliseconds)
-                    " duration=\"$durStr\""
-                } else ""
-                // FIX: Add Resolution Attribute
-                val resAttr = if (resource?.resolution != null) " resolution=\"${resource.resolution}\"" else ""
-
-                // FIX: Trust existing extension if present, otherwise append based on mime
-//                val safeTitle = obj.title.replace("[^a-zA-Z0-9.-]".toRegex(), "_")
-//                val finalName = if (safeTitle.contains(".")) {
-//                    // Title already has an extension (e.g., "Movie.mkv")
-//                    safeTitle
-//                } else {
-//                    // Append extension based on mime type
-//                    val ext = when {
-//                        mime.startsWith("video") -> ".mp4" // Safest fallback for video
-//                        mime.startsWith("audio") -> ".mp3"
-//                        mime.startsWith("image") -> ".jpg"
-//                        else -> "" // No extension
-//                    }
-//                    "$safeTitle$ext"
-//                }
-
-//                val url = "$baseUrl/content/$id/$finalName"
-                val url = "$baseUrl${resource?.uri}"
-
-                sb.append("""<item id="$id" parentID="$parent" restricted="1">""")
+                sb.append("<item id=\"$id\" parentID=\"$parent\" restricted=\"1\">")
                 sb.append("<dc:title>$title</dc:title>")
-                // FIX: Add Date Tag
                 if (obj.date != null) {
-                    val dateStr = formatDate(obj.date)
-                    sb.append("<dc:date>$dateStr</dc:date>")
+                    sb.append("<dc:date>${formatDate(obj.date)}</dc:date>")
                 }
                 sb.append("<upnp:class>$upnpClass</upnp:class>")
 
-                // Flags: OP=01 (Byte Seek) for better TV compatibility
+                // Flags for main media (Video)
                 val dlnaFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
-//                sb.append("""<res protocolInfo="http-get:*:$mime:$dlnaFlags">$url</res>""")
-                sb.append("""<res protocolInfo="http-get:*:$mime:$dlnaFlags"$sizeAttr$durationAttr$resAttr>$url</res>""")
+                // 1. Process all resources (Video/Audio and Subtitles)
+                obj.resources.forEachIndexed { index, res ->
+                    val mime = res.mimeType
+                    val sizeAttr = if (res.size != null && res.size > 0) " size=\"${res.size}\"" else ""
+                    val durationAttr = if (res.duration != null) " duration=\"${formatDuration(res.duration.inWholeMilliseconds)}\"" else ""
+                    val resAttr = if (res.resolution != null) " resolution=\"${res.resolution}\"" else ""
+
+                    val url = "$baseUrl${res.uri}"
+
+                    // Identify if this resource is a subtitle
+                    val isSubtitle = mime == "text/srt" || mime == "text/vtt" || mime == "application/x-sami"
+
+                    val proto = when {
+                        index == 0 -> "http-get:*:$mime:$dlnaFlags"
+                        isSubtitle -> {
+                            // Enrich subtitle protocolInfo with Profile Name (PN)
+                            val pn = when (mime) {
+                                "application/x-sami" -> "SMI"
+                                else -> "SRT"
+                            }
+                            "http-get:*:$mime:DLNA.ORG_PN=$pn;$dlnaFlags"
+                        }
+                        else -> "http-get:*:$mime:*"
+                    }
+
+                    // Add type="subtitle" for modern renderers
+                    val typeAttr = if (isSubtitle) " type=\"subtitle\"" else ""
+
+                    sb.append("<res protocolInfo=\"$proto\"$sizeAttr$durationAttr$resAttr$typeAttr>$url</res>")
+                }
+
+                // 2. Add Item-Level Extensions for the first detected subtitle
+                obj.resources.find { it.mimeType == "text/srt" || it.mimeType == "text/vtt" || it.mimeType == "application/x-sami" }?.let { res ->
+                    val url = "$baseUrl${res.uri}"
+                    val type = when (res.mimeType) {
+                        "text/srt" -> "srt"
+                        "text/vtt" -> "vtt"
+                        "application/x-sami" -> "smi"
+                        else -> "srt"
+                    }
+
+                    // Samsung Extension (Same as used in Casting)
+                    sb.append("<sec:CaptionInfoEx sec:type=\"$type\">$url</sec:CaptionInfoEx>")
+
+                    // PacketVideo (pv) Extensions (Critical for DMS Browsing)
+                    sb.append("<pv:subtitleFileUri>$url</pv:subtitleFileUri>")
+                    sb.append("<pv:subtitleFileType>${type.uppercase()}</pv:subtitleFileType>")
+                }
 
                 if (config.thumbnailProvider != null) {
                     val thumbUrl = "$baseUrl/thumb/${id}"
@@ -477,8 +504,13 @@ internal class MediaServerController(
             }
         }
         sb.append("</DIDL-Lite>")
+
+        // LOG 3: Capture the final generated XML
+        logLargeXml(tag, "<<< GENERATED DIDL-LITE", sb.toString())
+
         return sb.toString()
     }
+
 
     private fun formatDuration(millis: Long): String {
         val seconds = millis / 1000
@@ -507,28 +539,13 @@ internal class MediaServerController(
 
     private suspend fun sendSsdp(alive: Boolean) {
         val ip = networkInfo.getCurrentIpAddress() ?: return
-//        val msg = "IP from startAdvertising(): $ip"
-//        msg.forEachIndexed { index, ch ->
-//            Log.d("MediaServerController", "[$index] '$ch'")
-//        }
-
         val location = "http://$ip:$boundPort/description.xml"
         val nts = if (alive) "ssdp:alive" else "ssdp:byebye"
-
-        // We must announce 3 targets: Root, DeviceUUID, DeviceType
-        val targets = listOf(
-            "upnp:rootdevice",
-            serverUuid,
-            "urn:schemas-upnp-org:device:MediaServer:1"
-        )
+        val targets = listOf("upnp:rootdevice", serverUuid, "urn:schemas-upnp-org:device:MediaServer:1")
 
         targets.forEach { nt ->
             val packet = buildSsdpPacket(nt, serverUuid, location, nts)
-            try {
-                ssdpTransport.send(packet)
-            } catch (e: Exception) {
-                // Ignore send errors
-            }
+            try { ssdpTransport.send(packet) } catch (e: Exception) {}
         }
     }
 
@@ -619,5 +636,21 @@ internal class MediaServerController(
             .replace(">", "&gt;")
             .replace("\"", "&quot;")
             .replace("'", "&apos;")
+    }
+
+    private fun logLargeXml(tag: String, label: String, content: String) {
+        val maxLogSize = 3000
+        if (content.length <= maxLogSize) {
+            android.util.Log.d(tag, "$label: $content")
+        } else {
+            android.util.Log.d(tag, "$label (Multipart Start, Total Length: ${content.length})")
+            for (i in 0..content.length / maxLogSize) {
+                val start = i * maxLogSize
+                var end = (i + 1) * maxLogSize
+                end = if (end > content.length) content.length else end
+                android.util.Log.d(tag, "[$i]: ${content.substring(start, end)}")
+            }
+            android.util.Log.d(tag, "$label (Multipart End)")
+        }
     }
 }

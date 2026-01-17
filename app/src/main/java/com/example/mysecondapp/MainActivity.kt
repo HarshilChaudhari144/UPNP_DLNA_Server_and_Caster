@@ -34,6 +34,7 @@ import com.example.mysecondapp.dlna_lib.api.device.Device
 import com.example.mysecondapp.dlna_lib.api.media.MediaContainer
 import com.example.mysecondapp.dlna_lib.api.media.MediaContentProvider
 import com.example.mysecondapp.dlna_lib.api.media.MediaItem
+import com.example.mysecondapp.dlna_lib.api.media.MediaResource
 import com.example.mysecondapp.dlna_lib.api.playback.PlaybackState
 import com.example.mysecondapp.dlna_lib.api.playback.TransportState
 import kotlinx.coroutines.Dispatchers
@@ -177,6 +178,20 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     private var activeContainerId: String = "0"
     private val historyStack = mutableListOf<Pair<String, String>>()
     private var isClientInitialized = false
+
+    private val _manualSubtitlePath = MutableStateFlow<String?>(null)
+    val manualSubtitlePath: StateFlow<String?> = _manualSubtitlePath.asStateFlow()
+
+    fun setManualSubtitle(uri: Uri) {
+        val path = uriToPath(uri)
+        if (path != null) {
+            _manualSubtitlePath.value = path
+        }
+    }
+
+    fun clearManualSubtitle() {
+        _manualSubtitlePath.value = null
+    }
 
     private fun isIgnoringBatteryOptimizations(): Boolean {
         val powerManager = getApplication<Application>().getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -407,15 +422,48 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
     fun selectMedia(item: MediaItem) { _selectedMediaItem.value = item }
     fun clearSelection() { _selectedMediaItem.value = null }
 
+    // --- Update playOnRenderer to inject the manual subtitle ---
     fun playOnRenderer(renderer: Device, item: MediaItem) {
         if (!DlnaManager.isInitialized()) return
         viewModelScope.launch {
             try {
+                var finalItem = item
+                val manualSub = _manualSubtitlePath.value
+
+                if (manualSub != null) {
+                    // Determine MIME type
+                    val ext = manualSub.substringAfterLast('.').lowercase()
+                    val mime = when (ext) {
+                        "srt" -> "text/srt"
+                        "vtt" -> "text/vtt"
+                        "smi" -> "application/x-sami"
+                        else -> "text/srt" // Default fallback
+                    }
+
+                    // Construct a URI that our internal MediaServer can resolve
+                    // We use the same encoding logic as FileSystemContentProvider
+                    val safeId = if (manualSub.startsWith("/")) manualSub.substring(1) else manualSub
+                    val subUri = "/content/${java.net.URLEncoder.encode(safeId, "UTF-8")}"
+
+                    val subResource = MediaResource(
+                        uri = subUri,
+                        protocolInfo = "http-get:*:$mime:*",
+                        mimeType = mime
+                    )
+
+                    // Append the manual subtitle to the item's resources
+                    finalItem = item.copy(resources = item.resources + subResource)
+                }
+
                 DlnaManager.playback.setRenderer(renderer.deviceId)
-                DlnaManager.playback.play(item)
+                DlnaManager.playback.play(finalItem)
+
                 clearSelection()
+                clearManualSubtitle() // Clear after casting starts
                 _currentScreen.value = Screen.REMOTE_CONTROL
-            } catch (e: Exception) { e.printStackTrace() }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 

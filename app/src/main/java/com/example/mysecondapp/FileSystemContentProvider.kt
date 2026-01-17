@@ -1,5 +1,6 @@
 package com.example.mysecondapp
 
+import android.util.Log
 import com.example.mysecondapp.dlna_lib.api.media.*
 import java.io.File
 import java.io.FileInputStream
@@ -25,6 +26,9 @@ class FileSystemContentProvider(
         // Image
         "jpg", "jpeg", "png", "gif", "bmp", "webp"
     )
+
+    // Supported subtitle extensions for sidecar detection.
+    private val subtitleExtensions = setOf("srt", "vtt", "smi")
 
     override suspend fun list(containerId: String): List<MediaObject> {
         // If containerId is "0", list the configured root folders.
@@ -105,7 +109,7 @@ class FileSystemContentProvider(
         val id = file.absolutePath
         val parentId = file.parent ?: "0"
         val title = file.nameWithoutExtension
-        val mimeType = URLConnection.guessContentTypeFromName(file.name) ?: "application/octet-stream"
+        val mimeType = getMimeType(file)
         val size = file.length()
         val date = file.lastModified()
 
@@ -116,20 +120,25 @@ class FileSystemContentProvider(
             else -> return null // Ignore files with unknown primary media types
         }
 
-        // --- FIX: Remove the leading slash from the path before encoding it. ---
-        // This prevents the double slash issue (//) in the final URL.
-        // For example, "/storage/emulated/0/file.mkv" becomes "storage/emulated/0/file.mkv" before encoding.
-        val safeId = if (id.startsWith("/")) id.substring(1) else id
-        val resourceUri = "/content/${URLEncoder.encode(safeId, "UTF-8")}"
+        val resources = mutableListOf<MediaResource>()
 
-        val resource = MediaResource(
-            uri = resourceUri,
-            protocolInfo = "http-get:*:$mimeType:*",
-            mimeType = mimeType,
-            size = size,
-            duration = null, // Note: Reading duration/resolution from a File is complex
-            resolution = null  // and is omitted for simplicity.
-        )
+        // 1. Add the primary media resource
+        resources.add(createResourceForFile(file, mimeType))
+
+        // 2. Automatically detect and add sidecar subtitles for videos
+        if (mediaType == MediaType.VIDEO) {
+            val parentDir = file.parentFile
+            if (parentDir != null) {
+                subtitleExtensions.forEach { ext ->
+                    val subtitleFile = File(parentDir, "${file.nameWithoutExtension}.$ext")
+                    if (subtitleFile.exists() && subtitleFile.isFile) {
+                        val subMime = getMimeType(subtitleFile)
+                        resources.add(createResourceForFile(subtitleFile, subMime))
+                    }
+                }
+            }
+        }
+        Log.d("FileSystemContentProvider", "Resources:\n$resources")
 
         return MediaItem(
             id = id,
@@ -137,15 +146,48 @@ class FileSystemContentProvider(
             title = title,
             upnpClass = upnpClass,
             mediaType = mediaType,
-            resources = listOf(resource),
+            resources = resources,
+            thumbnail = null,
             date = date
         )
+    }
+
+    private fun createResourceForFile(file: File, mimeType: String): MediaResource {
+        val id = file.absolutePath
+        // Remove the leading slash from the path before encoding it for the URI.
+        val safeId = if (id.startsWith("/")) id.substring(1) else id
+        val resourceUri = "/content/${URLEncoder.encode(safeId, "UTF-8")}"
+
+        return MediaResource(
+            uri = resourceUri,
+            protocolInfo = "http-get:*:$mimeType:*",
+            mimeType = mimeType,
+            size = file.length(),
+            duration = null,
+            resolution = null
+        )
+    }
+
+    private fun getMimeType(file: File): String {
+        val extension = file.extension.lowercase()
+        return when (extension) {
+            "srt" -> "text/srt"
+            "vtt" -> "text/vtt"
+            "smi" -> "application/x-sami"
+            else -> URLConnection.guessContentTypeFromName(file.name) ?: "application/octet-stream"
+        }
     }
 
     private class FileSystemDataSource(private val file: File) : MediaDataSource {
         override val size: Long by lazy { file.length() }
         override val contentType: String by lazy {
-            URLConnection.guessContentTypeFromName(file.name) ?: "application/octet-stream"
+            val extension = file.extension.lowercase()
+            when (extension) {
+                "srt" -> "text/srt"
+                "vtt" -> "text/vtt"
+                "smi" -> "application/x-sami"
+                else -> URLConnection.guessContentTypeFromName(file.name) ?: "application/octet-stream"
+            }
         }
 
         override fun openFull(): InputStream {
