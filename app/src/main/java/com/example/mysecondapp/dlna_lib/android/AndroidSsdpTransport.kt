@@ -53,7 +53,7 @@ class AndroidSsdpTransport(
                     val data = String(packet.data, 0, packet.length)
                     // Log only M-SEARCH to avoid spamming NOTIFY logs
                     if (data.startsWith("M-SEARCH")) {
-                        Log.d(TAG, "RX Multicast from ${packet.address.hostAddress}:${packet.port} -> M-SEARCH")
+//                        Log.d(TAG, "RX Multicast from ${packet.address.hostAddress}:${packet.port} -> M-SEARCH")
                     }
                     onReceive(data, packet.address.hostAddress ?: "", packet.port)
                 } catch (e: IOException) { }
@@ -69,7 +69,7 @@ class AndroidSsdpTransport(
                     val packet = DatagramPacket(buffer, buffer.size)
                     unicastSocket?.receive(packet)
                     val data = String(packet.data, 0, packet.length)
-                    Log.d(TAG, "RX Unicast from ${packet.address.hostAddress}:${packet.port}")
+//                    Log.d(TAG, "RX Unicast from ${packet.address.hostAddress}:${packet.port}")
                     onReceive(data, packet.address.hostAddress ?: "", packet.port)
                 } catch (e: IOException) { }
             }
@@ -83,7 +83,7 @@ class AndroidSsdpTransport(
             val bytes = data.toByteArray()
             val packet = DatagramPacket(bytes, bytes.size, group, ssdpPort)
             unicastSocket?.send(packet)
-            Log.d(TAG, "TX Multicast (NOTIFY)")
+//            Log.d(TAG, "TX Multicast (NOTIFY)")
         } catch (e: Exception) { Log.e(TAG, "TX Error", e) }
     }
 
@@ -94,7 +94,7 @@ class AndroidSsdpTransport(
             val bytes = data.toByteArray()
             val packet = DatagramPacket(bytes, bytes.size, target, port)
             unicastSocket?.send(packet)
-            Log.d(TAG, "TX Unicast to $address:$port -> RESPONSE SENT")
+//            Log.d(TAG, "TX Unicast to $address:$port -> RESPONSE SENT")
         } catch (e: Exception) { Log.e(TAG, "TX Unicast Error", e) }
     }
 
@@ -116,10 +116,10 @@ class AndroidSsdpTransport(
             val group = InetAddress.getByName(ssdpGroup)
             val wifiInterface = getWifiNetworkInterface()
             if (wifiInterface != null) {
-                Log.d(TAG, "Binding Multicast to Interface: ${wifiInterface.displayName}")
+//                Log.d(TAG, "Binding Multicast to Interface: ${wifiInterface.displayName}")
                 ms.joinGroup(InetSocketAddress(group, ssdpPort), wifiInterface)
             } else {
-                Log.w(TAG, "No WiFi Interface found, binding default")
+//                Log.w(TAG, "No WiFi Interface found, binding default")
                 ms.joinGroup(group)
             }
             multicastSocket = ms
@@ -132,10 +132,10 @@ class AndroidSsdpTransport(
             val wifiIp = getIpAddressFromInterface(wifiInterface)
 
             if (wifiIp != null) {
-                Log.d(TAG, "Binding Unicast to IP: $wifiIp")
+//                Log.d(TAG, "Binding Unicast to IP: $wifiIp")
                 us.bind(InetSocketAddress(wifiIp, 0))
             } else {
-                Log.w(TAG, "Binding Unicast to Wildcard (0.0.0.0)")
+//                Log.w(TAG, "Binding Unicast to Wildcard (0.0.0.0)")
                 us.bind(InetSocketAddress(0))
             }
             unicastSocket = us

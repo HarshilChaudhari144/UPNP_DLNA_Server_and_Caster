@@ -38,7 +38,7 @@ internal class DeviceStateMachine(
 
                 // 3. Store
                 repository.upsert(device)
-                DlnaLogger.d(tag, "Device added/updated: ${device.friendlyName} [${device.deviceType}]")
+//                DlnaLogger.d(tag, "Device added/updated: ${device.friendlyName} [${device.deviceType}]")
 
             } catch (e: Exception) {
                 DlnaLogger.e(tag, "Failed to load device description from $location: ${e.message}")

@@ -271,7 +271,6 @@ internal class MediaServerController(
     private fun serveDescription(): HttpResponse {
         val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
 
-        // FIX: Only show icon block if we have a provider
         val iconXml = if (config.thumbnailProvider != null) """
             <iconList>
                 <icon>
@@ -284,7 +283,9 @@ internal class MediaServerController(
 
         val xml = """
             <?xml version="1.0"?>
-            <root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">
+            <root xmlns="urn:schemas-upnp-org:device-1-0" 
+                  xmlns:dlna="urn:schemas-dlna-org:device-1-0" 
+                  xmlns:sec="http://www.sec.co.kr/dlna">
                 <specVersion><major>1</major><minor>0</minor></specVersion>
                 <device>
                     <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
@@ -293,6 +294,9 @@ internal class MediaServerController(
                     <modelName>Kotlin Media Server</modelName>
                     <UDN>$serverUuid</UDN>
                     <dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>
+                    <dlna:X_DLNADOC>M-DMS-1.50</dlna:X_DLNADOC>
+                    <sec:ProductCap>smi,getCaptionInfo.sec</sec:ProductCap>
+                    <sec:X_ProductCap>smi,getCaptionInfo.sec</sec:X_ProductCap>
                     $iconXml
                     <serviceList>
                         <service>
@@ -337,40 +341,37 @@ internal class MediaServerController(
     private suspend fun handleBrowse(request: HttpRequest): HttpResponse {
         val body = request.body ?: return HttpResponse(400)
 
-        // LOG 1: Capture User-Agent and full SOAP Body
         val userAgent = request.headers.entries.find { it.key.equals("User-Agent", ignoreCase = true) }?.value ?: "Unknown"
         android.util.Log.i(tag, ">>> BROWSE REQUEST from $userAgent")
         logLargeXml(tag, "SOAP Body", body)
 
         val args = parseSoapBody(body)
-        val objectId = args["ObjectID"] ?: "0"
-        val browseFlag = args["BrowseFlag"] ?: "BrowseDirectChildren" // Extract Flag
+
+        // FIX: Decode the ObjectID to resolve paths that were encoded in DIDL output
+        val rawObjectId = args["ObjectID"] ?: "0"
+        val objectId = try { java.net.URLDecoder.decode(rawObjectId, "UTF-8") } catch (e: Exception) { rawObjectId }
+
+        val browseFlag = args["BrowseFlag"] ?: "BrowseDirectChildren"
         val startIndex = args["StartingIndex"]?.toIntOrNull() ?: 0
         val count = args["RequestedCount"]?.toIntOrNull() ?: 20
 
         try {
             val list: List<MediaObject>
 
-            // FIX: Handle Metadata vs Children request
             if (browseFlag == "BrowseMetadata") {
-                // TV wants info about THIS folder, not what's inside it
                 val metadata = config.contentProvider?.getMetadata(objectId)
                 list = if (metadata != null) listOf(metadata) else emptyList()
             } else {
-                // TV wants content inside the folder
                 list = config.contentProvider?.list(objectId) ?: emptyList()
             }
 
             val totalMatches = list.size
-
-            // Slice only for DirectChildren; Metadata is always 1 item (no pagination needed)
             val slicedList = if (browseFlag == "BrowseMetadata" || count == 0) {
                 list
             } else {
                 list.drop(startIndex).take(count)
             }
 
-            // LOG 2: Capture the arguments the TV specifically requested
             android.util.Log.i(tag, "Extracted Args: ObjectID=$objectId, Filter=${args["Filter"]}, Count=${args["RequestedCount"]}")
 
             val didlXml = generateDidl(slicedList)
@@ -406,6 +407,11 @@ internal class MediaServerController(
 
     // PHASE 2: Updated to handle multiple resources and Samsung specific tags
     // --- UPDATED generateDidl for Subtitle Visibility during Browsing ---
+    private fun encodeId(id: String): String {
+        return if (id == "0" || id == "-1") id
+        else java.net.URLEncoder.encode(id, "UTF-8")
+    }
+
     private fun generateDidl(items: List<MediaObject>): String {
         val ip = networkInfo.getCurrentIpAddress() ?: "127.0.0.1"
         val baseUrl = "http://$ip:$boundPort"
@@ -416,98 +422,96 @@ internal class MediaServerController(
         sb.append("xmlns:dc=\"http://purl.org/dc/elements/1.1/\" ")
         sb.append("xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" ")
         sb.append("xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\" ")
-        // Enforce namespaces required for Samsung and generic subtitle discovery
-        sb.append("xmlns:sec=\"http://www.sec.co.kr/dlna\" ")
+        sb.append("xmlns:sec=\"http://www.sec.co.kr/\" ")
         sb.append("xmlns:pv=\"http://www.pv.com/pvns/\">")
 
         items.forEach { obj ->
-            val id = escapeXml(obj.id)
-            val parent = escapeXml(obj.parentId ?: "-1")
+            // FIX: Encode IDs to prevent TV parsers from breaking on slashes/spaces
+            val id = encodeId(obj.id)
+            val parent = encodeId(obj.parentId ?: "-1")
             val title = escapeXml(obj.title)
 
             if (obj is MediaContainer) {
-                // FIX: Add childCount if available (some TVs hide folders without this)
                 val childCountAttr = if (obj.childCount != null) " childCount=\"${obj.childCount}\"" else ""
-                // FIX: Write searchable flag (static 0 or 1 based on obj.searchable)
                 val isSearchable = if (obj.searchable) "1" else "0"
                 sb.append("<container id=\"$id\" parentID=\"$parent\" restricted=\"1\" searchable=\"$isSearchable\"$childCountAttr>")
                 sb.append("<dc:title>$title</dc:title>")
-                // FIX: Use standard storageFolder class
                 sb.append("<upnp:class>object.container.storageFolder</upnp:class>")
                 sb.append("</container>")
             } else if (obj is MediaItem) {
                 val upnpClass = obj.upnpClass
-                sb.append("<item id=\"$id\" parentID=\"$parent\" restricted=\"1\">")
+
+                // FIX: Add rawDate attribute (Epoch seconds)
+                val rawDateAttr = if (obj.date != null) " rawDate=\"${obj.date / 1000}\"" else ""
+
+                sb.append("<item id=\"$id\" parentID=\"$parent\" restricted=\"1\"$rawDateAttr>")
                 sb.append("<dc:title>$title</dc:title>")
+
+                // FIX: Add missing mandatory-optional metadata
+                sb.append("<dc:creator>unknown</dc:creator>")
+                sb.append("<upnp:artist>unknown</upnp:artist>")
+                sb.append("<upnp:album>General</upnp:album>")
+
                 if (obj.date != null) {
                     sb.append("<dc:date>${formatDate(obj.date)}</dc:date>")
                 }
                 sb.append("<upnp:class>$upnpClass</upnp:class>")
 
-                // Flags for main media (Video)
                 val dlnaFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+                val videoRes = obj.resources.firstOrNull()
+                val subtitleRes = obj.resources.find { it.mimeType == "text/srt" || it.mimeType == "text/vtt" || it.mimeType == "application/x-sami" }
 
-                // 1. Process all resources (Video/Audio and Subtitles)
-                obj.resources.forEachIndexed { index, res ->
+                videoRes?.let { res ->
                     val mime = res.mimeType
+                    val url = "$baseUrl${res.uri}"
                     val sizeAttr = if (res.size != null && res.size > 0) " size=\"${res.size}\"" else ""
                     val durationAttr = if (res.duration != null) " duration=\"${formatDuration(res.duration.inWholeMilliseconds)}\"" else ""
                     val resAttr = if (res.resolution != null) " resolution=\"${res.resolution}\"" else ""
 
-                    val url = "$baseUrl${res.uri}"
-
-                    // Identify if this resource is a subtitle
-                    val isSubtitle = mime == "text/srt" || mime == "text/vtt" || mime == "application/x-sami"
-
-                    val proto = when {
-                        index == 0 -> "http-get:*:$mime:$dlnaFlags"
-                        isSubtitle -> {
-                            // Enrich subtitle protocolInfo with Profile Name (PN)
-                            val pn = when (mime) {
-                                "application/x-sami" -> "SMI"
-                                else -> "SRT"
-                            }
-                            "http-get:*:$mime:DLNA.ORG_PN=$pn;$dlnaFlags"
+                    var pvAttrs = ""
+                    subtitleRes?.let { sub ->
+                        val subUrl = "$baseUrl${sub.uri}"
+                        val subType = when (sub.mimeType) {
+                            "text/srt" -> "SRT"
+                            "text/vtt" -> "VTT"
+                            "application/x-sami" -> "SMI"
+                            else -> "SRT"
                         }
-                        else -> "http-get:*:$mime:*"
+                        pvAttrs = " pv:subtitleFileType=\"$subType\" pv:subtitleFileUri=\"$subUrl\""
                     }
 
-                    // Add type="subtitle" for modern renderers
-                    val typeAttr = if (isSubtitle) " type=\"subtitle\"" else ""
-
-                    sb.append("<res protocolInfo=\"$proto\"$sizeAttr$durationAttr$resAttr$typeAttr>$url</res>")
+                    sb.append("<res protocolInfo=\"http-get:*:$mime:$dlnaFlags\"$sizeAttr$durationAttr$resAttr$pvAttrs>$url</res>")
                 }
 
-                // 2. Add Item-Level Extensions for the first detected subtitle
-                obj.resources.find { it.mimeType == "text/srt" || it.mimeType == "text/vtt" || it.mimeType == "application/x-sami" }?.let { res ->
-                    val url = "$baseUrl${res.uri}"
-                    val type = when (res.mimeType) {
+                if (config.thumbnailProvider != null) {
+                    val thumbUrl = "$baseUrl/thumb/${id}"
+                    // FIX: Add profileID for better database indexing on TV
+                    sb.append("<upnp:albumArtURI dlna:profileID=\"JPEG_TN\" xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\">$thumbUrl</upnp:albumArtURI>")
+                }
+
+                subtitleRes?.let { sub ->
+                    val url = "$baseUrl${sub.uri}"
+                    val type = when (sub.mimeType) {
                         "text/srt" -> "srt"
                         "text/vtt" -> "vtt"
                         "application/x-sami" -> "smi"
                         else -> "srt"
                     }
-
-                    // Samsung Extension (Same as used in Casting)
                     sb.append("<sec:CaptionInfoEx sec:type=\"$type\">$url</sec:CaptionInfoEx>")
-
-                    // PacketVideo (pv) Extensions (Critical for DMS Browsing)
-                    sb.append("<pv:subtitleFileUri>$url</pv:subtitleFileUri>")
-                    sb.append("<pv:subtitleFileType>${type.uppercase()}</pv:subtitleFileType>")
                 }
 
-                if (config.thumbnailProvider != null) {
-                    val thumbUrl = "$baseUrl/thumb/${id}"
-                    sb.append("<upnp:albumArtURI>$thumbUrl</upnp:albumArtURI>")
+                subtitleRes?.let { sub ->
+                    val url = "$baseUrl${sub.uri}"
+                    val sizeAttr = if (sub.size != null && sub.size > 0) " size=\"${sub.size}\"" else ""
+                    sb.append("<res protocolInfo=\"http-get:*:${sub.mimeType}:*\"$sizeAttr>$url</res>")
                 }
+
                 sb.append("</item>")
             }
         }
         sb.append("</DIDL-Lite>")
 
-        // LOG 3: Capture the final generated XML
         logLargeXml(tag, "<<< GENERATED DIDL-LITE", sb.toString())
-
         return sb.toString()
     }
 
