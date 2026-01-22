@@ -140,6 +140,19 @@ class FileSystemContentProvider(
         }
         Log.d("FileSystemContentProvider", "Resources:\n$resources")
 
+        // 3. Generate Thumbnail metadata for Images and Videos
+        val thumbnail = if (mediaType == MediaType.VIDEO || mediaType == MediaType.IMAGE) {
+            val safeId = if (id.startsWith("/")) id.substring(1) else id
+            val thumbUri = "/thumb/${URLEncoder.encode(safeId, "UTF-8")}.jpg"
+            MediaThumbnail(
+                uri = thumbUri,
+                mimeType = "image/jpeg", // Always JPEG for Samsung compatibility
+                width = 320,
+                height = 320
+            )
+        } else null
+
+        Log.d("FileSystemContentProvider", "Thumbnail: $thumbnail")
         return MediaItem(
             id = id,
             parentId = parentId,
@@ -147,7 +160,7 @@ class FileSystemContentProvider(
             upnpClass = upnpClass,
             mediaType = mediaType,
             resources = resources,
-            thumbnail = null,
+            thumbnail = thumbnail,
             date = date
         )
     }

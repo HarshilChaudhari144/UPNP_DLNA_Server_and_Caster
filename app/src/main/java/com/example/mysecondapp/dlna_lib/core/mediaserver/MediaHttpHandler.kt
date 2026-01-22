@@ -16,9 +16,9 @@ internal class MediaHttpHandler(
 ) : HttpHandler {
 
     private val tag = "MediaHttpHandler"
-
-    // Matches Reference: OP=01 (Byte Seek)
-    private val dlnaFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+    // Separate flags for different content types
+    private val videoFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+    private val thumbFlags = "DLNA.ORG_PN=JPEG_TN"
 
     override suspend fun handle(request: HttpRequest): HttpResponse {
         if (request.method != HttpMethod.GET && request.method != HttpMethod.HEAD) {
@@ -75,7 +75,7 @@ internal class MediaHttpHandler(
                             "Content-Range" to "bytes $start-$end/$totalSize",
                             "Content-Length" to length.toString(),
                             "Accept-Ranges" to "bytes",
-                            "contentFeatures.dlna.org" to dlnaFlags,
+                            "contentFeatures.dlna.org" to videoFlags,
                             "transferMode.dlna.org" to "Streaming"
                         ),
                         inputStream = dataSource.openRange(start, length),
@@ -91,7 +91,7 @@ internal class MediaHttpHandler(
                 headers = mapOf(
                     "Content-Length" to totalSize.toString(),
                     "Accept-Ranges" to "bytes",
-                    "contentFeatures.dlna.org" to dlnaFlags,
+                    "contentFeatures.dlna.org" to videoFlags,
                     "transferMode.dlna.org" to "Streaming"
                 ),
                 inputStream = dataSource.openFull(),
@@ -104,21 +104,47 @@ internal class MediaHttpHandler(
         }
     }
 
-    private fun handleThumbnail(request: HttpRequest, mediaId: String): HttpResponse {
+    private fun handleThumbnail(request: HttpRequest, pathRaw: String): HttpResponse {
         if (thumbnailProvider == null) return HttpResponse(404)
 
+        // FIX: Strip the dummy .jpg extension if present so the file resolution
+        // logic can find the actual media file (e.g., .mp4 or .mkv)
+        val cleanPathRaw = if (pathRaw.endsWith(".jpg", ignoreCase = true)) {
+            pathRaw.substring(0, pathRaw.length - 4)
+        } else {
+            pathRaw
+        }
+
+        val potentialPath = "/$cleanPathRaw"
+        var file = File(potentialPath)
+
+        // Now this loop will correctly find the file
+        while (file.path != "/" && !file.isFile) {
+            file = file.parentFile ?: break
+        }
+
+        if (!file.isFile) {
+            DlnaLogger.e(tag, "Thumbnail lookup failed: $potentialPath")
+            return HttpResponse(404)
+        }
+        val mediaId = file.absolutePath
+
         try {
+            // 2. Request 320x320 thumbnail (standard for Samsung grid views)
             val result = thumbnailProvider.openThumbnail(mediaId, 320, 320)
                 ?: return HttpResponse(404)
 
-            val headers = mutableMapOf<String, String>()
-            if (result.size != null) {
-                headers["Content-Length"] = result.size.toString()
-            }
+            // Thumbnails are ALWAYS "Interactive"
+            val headers = mutableMapOf(
+                "Content-Length" to result.size.toString(),
+                "contentFeatures.dlna.org" to thumbFlags,
+                "transferMode.dlna.org" to "Interactive",
+                "realTimeInfo.dlna.org" to "DLNA.ORG_TLAG=*"
+            )
 
             return HttpResponse(
                 statusCode = 200,
-                mimeType = result.mimeType,
+                mimeType = result.mimeType, // Will be "image/jpeg" from our Step 1 implementation
                 headers = headers,
                 inputStream = result.inputStream,
                 contentLength = result.size

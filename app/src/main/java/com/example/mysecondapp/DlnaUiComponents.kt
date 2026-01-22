@@ -206,8 +206,11 @@ fun BrowserScreen(viewModel: DlnaViewModel) {
 @Composable
 fun RemoteControlScreen(viewModel: DlnaViewModel) {
     val playbackState by viewModel.playbackState.collectAsState()
-    val durationSeconds = playbackState.duration?.inWholeSeconds?.toFloat() ?: 1f
-    val positionSeconds = playbackState.position?.inWholeSeconds?.toFloat() ?: 0f
+    val durationSeconds = playbackState.duration?.inWholeSeconds ?: 0L
+    val positionSeconds = playbackState.position?.inWholeSeconds ?: 0L
+
+    // State to control the visibility of the numeric input dialog
+    var showSeekDialog by remember { mutableStateOf(false) }
 
     BackHandler { viewModel.closeRemote() }
 
@@ -222,16 +225,46 @@ fun RemoteControlScreen(viewModel: DlnaViewModel) {
             )
         }
     ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
             Icon(Icons.Default.Tv, null, Modifier.size(120.dp), tint = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(24.dp))
-            Text(playbackState.mediaItem?.title ?: "No Media Playing", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+            Text(
+                playbackState.mediaItem?.title ?: "No Media Playing",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
             Text("State: ${playbackState.transportState}", color = Color.Gray)
 
-            Slider(value = positionSeconds, onValueChange = { viewModel.seekTo(it.toLong()) }, valueRange = 0f..durationSeconds)
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(formatTime(positionSeconds.toLong()))
-                Text(formatTime(durationSeconds.toLong()))
+            // Slider remains for quick scrubbing
+            Slider(
+                value = positionSeconds.toFloat(),
+                onValueChange = { viewModel.seekTo(it.toLong()) },
+                valueRange = 0f..(if (durationSeconds > 0) durationSeconds.toFloat() else 1f)
+            )
+
+            // --- CHANGE: Make the time display clickable to open the numeric seeker ---
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { showSeekDialog = true }
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(formatTime(positionSeconds), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color.Gray)
+                    Spacer(Modifier.width(4.dp))
+                    Text("Tap to jump", fontSize = 12.sp, color = Color.Gray)
+                }
+                Text(formatTime(durationSeconds))
             }
 
             Spacer(Modifier.height(24.dp))
@@ -247,6 +280,81 @@ fun RemoteControlScreen(viewModel: DlnaViewModel) {
             Slider(value = (playbackState.volume ?: 0).toFloat(), onValueChange = { viewModel.setVolume(it.toInt()) }, valueRange = 0f..100f)
         }
     }
+
+    // Logic to show the Dialog
+    if (showSeekDialog) {
+        SeekTimeDialog(
+            initialSeconds = positionSeconds,
+            onDismiss = { showSeekDialog = false },
+            onConfirm = { totalSeconds ->
+                viewModel.seekTo(totalSeconds)
+                showSeekDialog = false
+            }
+        )
+    }
+}
+
+// --- NEW COMPONENT: Add this to the bottom of DlnaUiComponents.kt ---
+
+@Composable
+fun SeekTimeDialog(
+    initialSeconds: Long,
+    onDismiss: () -> Unit,
+    onConfirm: (Long) -> Unit
+) {
+    val h = (initialSeconds / 3600).toString()
+    val m = ((initialSeconds % 3600) / 60).toString()
+    val s = (initialSeconds % 60).toString()
+
+    var hours by remember { mutableStateOf(h) }
+    var minutes by remember { mutableStateOf(m) }
+    var seconds by remember { mutableStateOf(s) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Jump to Time") },
+        text = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TimeInput(value = hours, label = "HH", onValueChange = { hours = it.take(2) })
+                Text(":", fontWeight = FontWeight.Bold)
+                TimeInput(value = minutes, label = "MM", onValueChange = { minutes = it.take(2) })
+                Text(":", fontWeight = FontWeight.Bold)
+                TimeInput(value = seconds, label = "SS", onValueChange = { seconds = it.take(2) })
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val hLong = hours.toLongOrNull() ?: 0L
+                val mLong = minutes.toLongOrNull() ?: 0L
+                val sLong = seconds.toLongOrNull() ?: 0L
+                val total = (hLong * 3600) + (mLong * 60) + sLong
+                onConfirm(total)
+            }) {
+                Text("Seek")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+@Composable
+fun TimeInput(value: String, label: String, onValueChange: (String) -> Unit) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = { if (it.all { char -> char.isDigit() }) onValueChange(it) },
+        label = { Text(label) },
+        modifier = Modifier.width(65.dp),
+        singleLine = true,
+        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+        )
+    )
 }
 
 // Replace the existing ServerSettingsScreen with this new one
@@ -461,9 +569,14 @@ fun PlayOptionsSheet(mediaItem: MediaItem, viewModel: DlnaViewModel, onDismiss: 
 }
 
 fun formatTime(seconds: Long): String {
-    val m = seconds / 60
+    val h = seconds / 3600
+    val m = (seconds % 3600) / 60
     val s = seconds % 60
-    return String.format("%02d:%02d", m, s)
+    return if (h > 0) {
+        String.format("%02d:%02d:%02d", h, m, s)
+    } else {
+        String.format("%02d:%02d", m, s)
+    }
 }
 
 @Composable

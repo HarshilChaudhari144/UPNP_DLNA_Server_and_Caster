@@ -242,13 +242,17 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
         val myContentProvider = FileSystemContentProvider(rootFiles)
         this.contentProvider = myContentProvider
 
+        // --- ADDED: Instantiate the Thumbnail Provider ---
+        val myThumbnailProvider = FileSystemThumbnailProvider()
+
         val config = DlnaConfig(
             enableMediaServer = true,
             serverName = "Android (${Build.MODEL})",
             serverUdn = prefs.getString("server_udn", null) ?: UUID.randomUUID().toString().also {
                 prefs.edit().putString("server_udn", it).apply()
             },
-            contentProvider = myContentProvider // Pass the new provider
+            contentProvider = myContentProvider,
+            thumbnailProvider = myThumbnailProvider // --- ADDED: Register the provider ---
         )
         val platform = AndroidDlnaPlatform(context)
 
