@@ -32,6 +32,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.documentfile.provider.DocumentFile
 // Add these imports if they are missing
 import java.io.File
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
 
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -44,6 +48,9 @@ fun DeviceListScreen(viewModel: DlnaViewModel) {
             TopAppBar(
                 title = { Text("DLNA App") },
                 actions = {
+                    IconButton(onClick = { viewModel.refreshDevices() }) {
+                        Icon(Icons.Default.Refresh, "Refresh Devices")
+                    }
                     IconButton(onClick = { viewModel.openSettings() }) {
                         Icon(Icons.Default.Settings, "Server Settings")
                     }
@@ -110,9 +117,9 @@ fun DeviceCard(device: Device, onBrowse: () -> Unit, onRemote: () -> Unit) {
                 Spacer(Modifier.width(16.dp))
                 Column(Modifier.weight(1f)) {
                     Text(device.friendlyName, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Text(if(isRenderer) "Renderer" else "Server", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+//                    Text(if(isRenderer) "Renderer" else "Server", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                     Text("LocationUrl: ${device.locationUrl}", fontSize = 12.sp)
-                    Text("Services: ${device.services}", fontSize = 12.sp)
+//                    Text("Services: ${device.services}", fontSize = 12.sp)
                 }
             }
             Spacer(Modifier.height(12.dp))
@@ -154,6 +161,12 @@ fun BrowserScreen(viewModel: DlnaViewModel) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
                     }
                 },
+                actions = {
+                    // --- ADD THIS: Refresh Button ---
+                    IconButton(onClick = { viewModel.refreshBrowser() }) {
+                        Icon(Icons.Default.Refresh, "Refresh Content")
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
             )
         }
@@ -183,16 +196,41 @@ fun BrowserScreen(viewModel: DlnaViewModel) {
                         supportingContent = {
                             val info = file.resources.firstOrNull()
                             Column {
-                                Text("Mime: ${info?.mimeType ?: "Unknown"}", fontSize = 12.sp)
-                                Text("Dur: ${info?.duration} | Size: ${info?.size}", fontSize = 12.sp)
-                                Text("Date: ${file.date}", fontSize = 12.sp)
+//                                Text("Mime: ${info?.mimeType ?: "Unknown"}", fontSize = 12.sp)
+//                                Text("Dur: ${info?.duration} | Size: ${info?.size}", fontSize = 12.sp)
+//                                Text("Date: ${file.date}", fontSize = 12.sp)
                                 Text("Resources: ${file.resources}", fontSize = 12.sp)
-                                Text("Thumbnail: ${file.thumbnail}", fontSize = 12.sp)
+//                                Text("Thumbnail: ${file.thumbnail}", fontSize = 12.sp)
                                 Text("Uri: ${info?.uri}", fontSize = 12.sp)
-                                Text("Res: ${info?.resolution} | Protocol: ${info?.protocolInfo}", fontSize = 12.sp)
+//                                Text("Res: ${info?.resolution} | Protocol: ${info?.protocolInfo}", fontSize = 12.sp)
                             }
                         },
-                        leadingContent = { Icon(Icons.Default.MusicNote, null) },
+                        leadingContent = {
+                            if (file.thumbnail != null) {
+                                // Using Box to provide a placeholder background while loading
+                                Box(
+                                    modifier = Modifier
+                                        .size(40.dp)
+                                        .background(Color.LightGray, RoundedCornerShape(4.dp)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    AsyncImage(
+                                        model = file.thumbnail.uri,
+                                        contentDescription = null,
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                }
+                            } else {
+                                // Standard fallback icons
+                                val icon = when (file.mediaType) {
+                                    com.example.mysecondapp.dlna_lib.api.media.MediaType.VIDEO -> Icons.Default.VideoLibrary
+                                    com.example.mysecondapp.dlna_lib.api.media.MediaType.IMAGE -> Icons.Default.Image
+                                    else -> Icons.Default.MusicNote
+                                }
+                                Icon(icon, null, modifier = Modifier.size(40.dp))
+                            }
+                        },
                         modifier = Modifier.clickable { viewModel.selectMedia(file) }
                     )
                     Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))

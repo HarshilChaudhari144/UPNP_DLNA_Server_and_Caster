@@ -171,4 +171,16 @@ internal class SsdpController(
         val part = cc.split(",").find { it.trim().lowercase().startsWith("max-age") }
         return part?.substringAfter("=")?.trim()?.toIntOrNull() ?: 1800
     }
+
+    fun discover() {
+        dlnaScope.launch(Dispatchers.IO) {
+            searchTargets.forEach { target ->
+                try {
+                    transport.send(buildSearchPacket(target))
+                } catch (e: Exception) {
+                    DlnaLogger.w(tag, "Failed to send M-SEARCH for $target")
+                }
+            }
+        }
+    }
 }

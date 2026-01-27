@@ -146,10 +146,23 @@ internal class DidlLiteParser {
         val resources = parseResources(element)
         val mediaType = determineMediaType(upnpClass, resources)
 
+        // 1. Try to get thumbnail from explicit albumArtURI tag
         val albumArtUri = getTagValue(element, "albumArtURI")
-        val thumbnail = if (albumArtUri != null) {
+        var thumbnail = if (albumArtUri != null) {
             MediaThumbnail(uri = albumArtUri, mimeType = "image/jpeg", width = null, height = null)
         } else null
+
+        // 2. FALLBACK: If no albumArtURI, check if any <res> tag is an image
+        if (thumbnail == null) {
+            resources.find { it.mimeType.startsWith("image/") }?.let { imageRes ->
+                thumbnail = MediaThumbnail(
+                    uri = imageRes.uri,
+                    mimeType = imageRes.mimeType,
+                    width = null,
+                    height = null
+                )
+            }
+        }
 
         return MediaItem(
             id = id,
@@ -158,8 +171,8 @@ internal class DidlLiteParser {
             upnpClass = upnpClass,
             mediaType = mediaType,
             resources = resources,
-            thumbnail = thumbnail,
-            date = date // <--- Pass the parsed date
+            thumbnail = thumbnail, // Now carries the fallback image
+            date = date
         )
     }
 

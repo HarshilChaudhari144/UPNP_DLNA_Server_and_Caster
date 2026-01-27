@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -408,6 +409,23 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun refreshDevices() {
+        if (!DlnaManager.isInitialized()) return
+        viewModelScope.launch {
+            _isLoading.value = true
+            try {
+                // This triggers an active SSDP M-SEARCH to find devices again
+                DlnaManager.devices.refresh()
+                delay(1000) // Give it a moment to receive responses
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
+    // --- UPDATED: Robust loadContainer with Crash Prevention ---
     private fun loadContainer(id: String, title: String) {
         val deviceId = currentDeviceId ?: return
         if (!DlnaManager.isInitialized()) return
@@ -415,12 +433,32 @@ class DlnaViewModel(application: Application) : AndroidViewModel(application) {
         _isLoading.value = true
         _currentContainerTitle.value = title
         activeContainerId = id
+
         viewModelScope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { DlnaManager.browser.browse(deviceId, id, 0, 100) }
+                val result = withContext(Dispatchers.IO) {
+                    DlnaManager.browser.browse(deviceId, id, 0, 100)
+                }
                 _browseResult.value = result
-            } catch (e: Exception) { e.printStackTrace() } finally { _isLoading.value = false }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                // If the device is gone, show an error and go back
+                _browseResult.value = null
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(getApplication(), "Device unreachable", Toast.LENGTH_SHORT).show()
+                    // If we fail in the browser, go back to device list
+                    if (_currentScreen.value == Screen.BROWSER) {
+                        navigateUp()
+                    }
+                }
+            } finally {
+                _isLoading.value = false
+            }
         }
+    }
+
+    fun refreshBrowser() {
+        loadContainer(activeContainerId, _currentContainerTitle.value)
     }
 
     fun selectMedia(item: MediaItem) { _selectedMediaItem.value = item }

@@ -25,4 +25,10 @@ interface DeviceRegistry {
      * Filters the registry for Media Renderers (TVs, Speakers).
      */
     fun getMediaRenderers(): List<Device>
+
+    /**
+     * Triggers an active network scan (SSDP M-SEARCH) to find new devices
+     * or verify existing ones.
+     */
+    fun refresh()
 }

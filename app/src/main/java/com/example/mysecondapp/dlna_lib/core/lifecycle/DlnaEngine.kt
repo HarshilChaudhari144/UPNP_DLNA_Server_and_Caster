@@ -33,6 +33,15 @@ internal class DlnaEngine(
         override fun getDevice(deviceId: String) = deviceRepository.getDevice(deviceId)
         override fun getMediaServers() = deviceRepository.getServers()
         override fun getMediaRenderers() = deviceRepository.getRenderers()
+        override fun refresh() {
+            // 1. Clear the local repository so dead devices disappear from the UI immediately
+            deviceRepository.clear()
+            // 2. Clear the SSDP cache so we don't rely on old timers
+            ssdpCache.stop()
+            ssdpCache.start()
+            // 3. Trigger the active network scan
+            ssdpController.discover()
+        }
     }
     private val descriptorParser = DeviceDescriptorParser()
     private val deviceStateMachine = DeviceStateMachine(deviceRepository, descriptorParser)
